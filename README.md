@@ -22,3 +22,9 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program. If not, see <http://www.gnu.org/licenses/>.
 ```
+---
+
+This is a fork of SagerNet/sing-tun. It differs from upstream in exactly one behavioural
+change — the system stack's TCP accept loop self-heals after an unexpected accept error
+instead of ending permanently. See [FORK.md](FORK.md) for the failure mode, the
+provenance of the branch sing-box pins, and the removal condition.
