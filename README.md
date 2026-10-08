@@ -4,6 +4,11 @@ Simple transparent proxy library.
 
 For Linux, Windows, macOS and iOS.
 
+> **Fork notice.** This is the `Piggy-Cat-bit-shadow` fork, based on upstream commit
+> `d769a7080ca203f63735ba93e95014e363e25d62`. It adds TCP accept-loop self-healing to the
+> system stack and nothing else. See [FORK.md](FORK.md) for what changed, why, the
+> provenance and the removal condition.
+
 ## License
 
 ```
