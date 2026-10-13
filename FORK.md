@@ -107,8 +107,9 @@ The change defines the ownership rather than papering over the access:
 | --- | --- |
 | `dev` | a mirror of `SagerNet/sing-tun` `dev`, never modified |
 | `fix/acceptloop-selfheal` | the original fork, based on `d769a7080ca2` (2026-10-06). Superseded: it was based on an upstream revision that upstream has since rewritten out of `dev`, so the sing-box tree no longer pins it. Kept as history. |
-| `sync/go-stack-plus-040` | `SagerNet/sing-tun` `dev` @ `7539c9855f19` (2026-10-07, "Rework forward NAT with UDP mapping and fragment support") with the 040 change and its regression test applied and nothing else. |
-| `sync/go-stack-plus-040-and-race` | the branch sing-box pins. `sync/go-stack-plus-040` plus the Go stack Start/Close handshake (`stack_go.go`) and its regression test (`stack_go_startclose_test.go`), and nothing else. |
+| `sync/go-stack-plus-040` | `SagerNet/sing-tun` `dev` @ `7539c9855f19` (2026-10-07, "Rework forward NAT with UDP mapping and fragment support") with the 040 change and its regression test applied and nothing else. Superseded by `sync/go-stack-plus-040-and-race`, which is itself superseded; kept as history. |
+| `sync/go-stack-plus-040-and-race` | `sync/go-stack-plus-040` plus the Go stack Start/Close handshake (`stack_go.go`) and its regression test (`stack_go_startclose_test.go`), and nothing else. Superseded: it sits on the old `7539c9855f19` base, which upstream has since rewritten out of `dev`. Kept as history. |
+| `sync/go-stack-plus-040-and-race-9ffa539` | **the branch sing-box pins.** Both changes re-applied to the new upstream base `9ffa5391a2ad`, tip `6937951ec9b644ea2341e7a6725d209ba0ecf3ad`. See its provenance below. |
 
 ## Provenance (`sync/go-stack-plus-040`)
 
@@ -135,6 +136,50 @@ The change defines the ownership rather than papering over the access:
 | This change / test | `stack_go.go` (the `s.access` publish/close handshake) / `stack_go_startclose_test.go` (new) |
 | Upstream status at fork time | `dev` HEAD is `7539c9855f19` itself — upstream has not moved past the racy revision. `main`, `stable`, `dev-firewalld`, `draft-windows-auto-redirect` and `codex/propose-fix-for-docker-firewall-policy-bypass` do not contain `stack_go.go` at all; only the older `wip` (2026-09-07, pre-`access`-lock) has a Go stack, and it carries the same class of bug with no synchronisation whatsoever. No upstream fix exists. |
 | Changed files vs upstream base | `FORK.md`, `README.md` (the 040 notice), `stack_system.go`, `stack_system_accept_test.go`, `stack_go.go`, `stack_go_startclose_test.go` — no other file |
+
+Superseded. The section above is kept as history; the branch sing-box actually pins is the
+one below.
+
+## Provenance (`sync/go-stack-plus-040-and-race-9ffa539`)
+
+The current branch. It carries the same two behavioural changes as the superseded branch
+above, re-applied to a newer upstream base because `7539c9855f19` is an upstream revision
+that upstream has since rewritten out of `dev`; carrying a fix on a dead base would have
+shipped a stack revision nobody else has tested.
+
+| | |
+| --- | --- |
+| Upstream | `https://github.com/SagerNet/sing-tun` |
+| Branch | `sync/go-stack-plus-040-and-race-9ffa539` |
+| Runtime pin (sing-box `replace`) | `6937951ec9b644ea2341e7a6725d209ba0ecf3ad` |
+| Upstream base commit | `9ffa5391a2adc292182ffbeac089e795b1a3190d` (`dev` HEAD) |
+| Base module version | `v0.9.7-0.20261013140216-9ffa5391a2ad` (the version sing-box requires) |
+| Fork module version | `v0.0.0-20261013212953-6937951ec9b6` (the version sing-box's `replace` pins) |
+| Upstream change | "Batch loopback hairpin writes in go stack" |
+| 040 change / test | `stack_system.go` / `stack_system_accept_test.go` |
+| Handshake change / test | `stack_go.go` (the `s.access` publish/close handshake) / `stack_go_startclose_test.go` |
+| Changed files vs upstream base | `FORK.md`, `README.md`, `stack_system.go`, `stack_system_accept_test.go`, `stack_go.go`, `stack_go_startclose_test.go` — no other file |
+
+Both changes were **clean cherry-picks onto `9ffa5391`, with ZERO CONFLICTS**. That is worth
+recording rather than merely reporting: a patch that still applies unchanged is itself the
+evidence that upstream has not adopted the behaviour, since an upstream fix touching the same
+lines would have forced a conflict.
+
+They are, in the order they were applied:
+
+1. **system stack TCP accept-loop self-heal** (`stack_system.go`) — classify the accept error
+   (orderly close → quiet exit; anything else → recover), close the unusable listener, re-bind
+   the same address, publish the new port under a lock, bounded backoff, and never resurrect
+   the listener after `Close`.
+2. **Go stack Start/Close published handshake** (`stack_go.go`) — `Close` owns the started
+   state and snapshots the resources under the existing `s.access` lock, `Start` refuses once
+   closed, and a duplicate `Start` is a no-op.
+
+**Upstream's own work in `9ffa5391` is not touched by either patch.** The commit's changes to
+`stack_go_engine.go`, `stack_go_io_darwin.go` and `stack_go_memory_arena.go` — the hairpin
+write batching, the `platformIO.flush()` / `flushLocked()` lifecycle, and the arena change —
+are present verbatim in this branch. The fork's diff against `9ffa5391` does not name any of
+those three files, so they cannot have been reverted or overridden.
 
 ## Tests
 
