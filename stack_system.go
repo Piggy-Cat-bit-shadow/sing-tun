@@ -54,14 +54,19 @@ type System struct {
 	// listenerAccess serialises access to the TCP listener fields above between Close, the accept
 	// loop's recovery path and the dispatch path that reads the listener port.
 	listenerAccess sync.Mutex
-	// listenConfig / listenFamily4 / listenFamily6 / listenAddress4 / listenAddress6 are what the
-	// accept loop needs to recreate a listener after an unexpected failure. They are recorded by
-	// start() because they are exactly the arguments it used.
-	listenConfig   *net.ListenConfig
-	listenNetwork4 string
-	listenAddress4 string
-	listenNetwork6 string
-	listenAddress6 string
+	// listenConfig is what the accept loop needs to recreate a listener after an unexpected
+	// failure. It is recorded by start() because it is exactly the configuration it bound with.
+	//
+	// It is recorded ONCE, before either family is bound, because the configuration is not
+	// family-specific: the network name and the address are per-family arguments to the bind, and
+	// they are passed to acceptLoop and recoverListener separately. Recording it inside the IPv4
+	// branch - which is what this did - left an IPv6-only stack with no configuration to re-bind
+	// with, so recoverListener returned "no listen configuration recorded" and the accept loop
+	// terminated permanently. The listener's port is what every new SYN is rewritten onto, so the
+	// stack then kept rewriting connections onto a dead port while UDP and QUIC carried on working.
+	//
+	// Only read under listenerAccess, in recoverListener; written here, before any listener exists.
+	listenConfig *net.ListenConfig
 	// closing is set before the listeners are closed, so the accept loop can tell an orderly
 	// shutdown apart from an unexpected failure and never re-creates a listener after Close.
 	closing atomic.Bool
@@ -208,6 +213,10 @@ func (s *System) start() error {
 	}
 	var tcpListener net.Listener
 	var err error
+	// The bind configuration is family-independent, so it is recorded once for BOTH families rather
+	// than inside the IPv4 branch. An IPv6-only stack otherwise has nothing to re-bind with and
+	// cannot recover its accept loop; see the field comment.
+	s.listenConfig = &listener
 	if s.inet4NextAddress.IsValid() {
 		network := "tcp4"
 		address := net.JoinHostPort(s.inet4Address.String(), "0")
@@ -224,11 +233,6 @@ func (s *System) start() error {
 		s.tcpListener = tcpListener
 		s.tcpPort = M.SocksaddrFromNet(tcpListener.Addr()).Port
 		s.tcpNat4 = NewNat(s.ctx, s.udpTimeout)
-		// The accept loop has to be able to re-bind this exact address after an unexpected
-		// failure, so the arguments it was bound with are recorded rather than re-derived.
-		s.listenConfig = &listener
-		s.listenNetwork4 = network
-		s.listenAddress4 = address
 		go s.acceptLoop(tcpListener, s.tcpNat4, network, address)
 	}
 	if s.inet6NextAddress.IsValid() {
@@ -247,8 +251,6 @@ func (s *System) start() error {
 		s.tcpListener6 = tcpListener
 		s.tcpPort6 = M.SocksaddrFromNet(tcpListener.Addr()).Port
 		s.tcpNat6 = NewNat(s.ctx, s.udpTimeout)
-		s.listenNetwork6 = network
-		s.listenAddress6 = address
 		go s.acceptLoop(tcpListener, s.tcpNat6, network, address)
 	}
 	udpNATOptions := s.udpNATOptions
