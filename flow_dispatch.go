@@ -250,15 +250,17 @@ func (d *ForwardDispatcher) Close() {
 		for key, entry := range stage.table {
 			stage.removeEntry(key, entry, FlowCloseReset)
 		}
-		stage.access.Unlock()
 		// A stage closed with owned packets still staged would otherwise leak them: Flush returns
-		// early once the dispatcher is closed.
+		// early once the dispatcher is closed. The release is under the same lock Flush takes for
+		// the port loop, so a Flush that already passed the closed check cannot hand a buffer to
+		// the port while it is being released here.
 		for index := range stage.ports {
 			if len(stage.ports[index].buffers) > 0 {
 				buf.ReleaseMulti(stage.ports[index].buffers)
 				stage.ports[index].buffers = nil
 			}
 		}
+		stage.access.Unlock()
 	}
 	d.portsAccess.Lock()
 	returnPaths := slices.Collect(maps.Values(d.ports))
@@ -765,6 +767,9 @@ func (s *ForwardStage) Flush() {
 		}
 		s.access.Unlock()
 	}
+	// The port loop runs under access: Close releases staged owned buffers under the same lock, so
+	// a Flush that observed the dispatcher open cannot race a close-time release.
+	s.access.Lock()
 	for index := range s.ports {
 		staged := &s.ports[index]
 		if len(staged.buffers) > 0 {
@@ -791,6 +796,7 @@ func (s *ForwardStage) Flush() {
 		clear(staged.packets)
 		staged.packets = staged.packets[:0]
 	}
+	s.access.Unlock()
 	if retain := max(s.segmentUsed, segmentRetainCount); len(s.segmentBuffers) > retain {
 		clear(s.segmentBuffers[retain:])
 		s.segmentBuffers = s.segmentBuffers[:retain]
