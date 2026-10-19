@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-tun/gtcpip"
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/gtcpip/header"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -163,6 +164,9 @@ type ForwardDispatcher struct {
 type stagedPort struct {
 	nat     *portNAT
 	packets [][]byte
+	// buffers are owned packets for a PacketBufferPort. A port is either a packets port or a
+	// buffers port for the lifetime of the stage, never both.
+	buffers []*buf.Buffer
 }
 
 type ForwardStage struct {
@@ -247,6 +251,14 @@ func (d *ForwardDispatcher) Close() {
 			stage.removeEntry(key, entry, FlowCloseReset)
 		}
 		stage.access.Unlock()
+		// A stage closed with owned packets still staged would otherwise leak them: Flush returns
+		// early once the dispatcher is closed.
+		for index := range stage.ports {
+			if len(stage.ports[index].buffers) > 0 {
+				buf.ReleaseMulti(stage.ports[index].buffers)
+				stage.ports[index].buffers = nil
+			}
+		}
 	}
 	d.portsAccess.Lock()
 	returnPaths := slices.Collect(maps.Values(d.ports))
@@ -649,10 +661,14 @@ func (s *ForwardStage) forwardToPort(flow *forwardFlow, packet *forwardPacket, r
 		flow.tracker.CountForward(len(raw))
 	}
 	rewriteForward(flow, packet)
-	if meta != nil {
-		raw = s.copyForStage(raw)
+	// A PacketBufferPort takes ownership of a headroomed buffer, so the packet is copied exactly
+	// once (into that buffer) instead of into the stage and then again into the port's own buffer.
+	if !s.stagePortBuffer(flow.nat, raw) {
+		if meta != nil {
+			raw = s.copyForStage(raw)
+		}
+		s.stagePort(flow.nat, raw)
 	}
-	s.stagePort(flow.nat, raw)
 }
 
 func (s *ForwardStage) copyForStage(raw []byte) []byte {
@@ -672,6 +688,12 @@ func rewriteForward(flow *forwardFlow, packet *forwardPacket) {
 }
 
 func (s *ForwardStage) stagePort(nat *portNAT, packet []byte) {
+	// Fragmentation and TCP resegmentation call this with a packet that is not the forwarded
+	// frame's bytes. A buffer port must still receive those in order with the rest of the
+	// traffic to that port, so they take the same owned-buffer path.
+	if s.stagePortBuffer(nat, packet) {
+		return
+	}
 	for index := range s.ports {
 		if s.ports[index].nat == nat {
 			s.ports[index].packets = append(s.ports[index].packets, packet)
@@ -679,6 +701,33 @@ func (s *ForwardStage) stagePort(nat *portNAT, packet []byte) {
 		}
 	}
 	s.ports = append(s.ports, stagedPort{nat: nat, packets: [][]byte{packet}})
+}
+
+// stagePortBuffer copies packet into one headroomed buffer and stages it for a PacketBufferPort.
+// It reports whether the port takes owned buffers; when it returns false the caller keeps using
+// the borrowed staging path.
+func (s *ForwardStage) stagePortBuffer(nat *portNAT, packet []byte) bool {
+	bufferPort, ok := nat.port.(PacketBufferPort)
+	if !ok {
+		return false
+	}
+	headroom := bufferPort.PacketHeadroom()
+	if headroom < 0 {
+		headroom = 0
+	}
+	buffer := buf.NewSize(headroom + len(packet))
+	if headroom > 0 {
+		buffer.Resize(headroom, 0)
+	}
+	_, _ = buffer.Write(packet)
+	for index := range s.ports {
+		if s.ports[index].nat == nat {
+			s.ports[index].buffers = append(s.ports[index].buffers, buffer)
+			return true
+		}
+	}
+	s.ports = append(s.ports, stagedPort{nat: nat, buffers: []*buf.Buffer{buffer}})
+	return true
 }
 
 func (s *ForwardStage) stageReject(packet *forwardPacket, raw []byte, meta *ForwardFrameMeta) {
@@ -718,6 +767,20 @@ func (s *ForwardStage) Flush() {
 	}
 	for index := range s.ports {
 		staged := &s.ports[index]
+		if len(staged.buffers) > 0 {
+			if bufferPort, ok := staged.nat.port.(PacketBufferPort); ok {
+				// Ownership transfers unconditionally: on any return the port has released or
+				// transferred every buffer, so this code must not touch them again.
+				err := bufferPort.WritePacketBuffers(staged.buffers)
+				if err != nil {
+					d.logger.Trace(E.Cause(err, "forward packets"))
+				}
+			} else {
+				buf.ReleaseMulti(staged.buffers)
+			}
+			clear(staged.buffers)
+			staged.buffers = staged.buffers[:0]
+		}
 		if len(staged.packets) == 0 {
 			continue
 		}
