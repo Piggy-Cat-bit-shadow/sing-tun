@@ -422,10 +422,21 @@ func (s *UDPNat) getOrCreate(key udpNatSessionKey, source M.Socksaddr, destinati
 	return conn, true
 }
 
+// udpNatDroppedPackets counts datagrams discarded because a session's queue was full or the
+// session was closed. It is incremented only on the drop path, so it adds no work to a healthy
+// flow, and it is the only way to tell "the tunnel went idle" apart from "the queue shed load".
+var udpNatDroppedPackets atomic.Uint64
+
+// UDPNatDroppedPackets reports how many datagrams UDP NAT has dropped since process start.
+func UDPNatDroppedPackets() uint64 {
+	return udpNatDroppedPackets.Load()
+}
+
 func (c *UDPNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	c.packetAccess.RLock()
 	select {
 	case <-c.doneChan:
+		udpNatDroppedPackets.Add(1)
 		buffer.Release()
 		c.packetAccess.RUnlock()
 		return
@@ -439,6 +450,7 @@ func (c *UDPNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	select {
 	case c.packetChan <- packet:
 	default:
+		udpNatDroppedPackets.Add(1)
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
 	}
