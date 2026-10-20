@@ -938,18 +938,58 @@ type returnBatch struct {
 	packets   [][]byte
 }
 
+// ReturnPackets classifies one batch of packets returning from a port and writes each group back
+// through the writeback that owns it.
+//
+// # Why there is no grouping container on the common path
+//
+// A writeback is the stage that owns the flow, and in production one port serves one stage, so a
+// whole batch carries a single writeback. The previous implementation could not know that before
+// classifying, so it always built a []returnBatch plus one packet slice per batch: two
+// allocations for a single packet, seven for a 64-packet burst. The grouping is only needed when a
+// SECOND writeback appears.
+//
+// So the packets are compacted in place while every packet so far shares one writeback, and the
+// original grouping is built on the first disagreement. That keeps the allocation-free path exact
+// and leaves the multi-writeback path with the same batches, boundaries and order it had before.
+//
+// The compaction reuses the caller's slice, so it may only write at positions already read; that is
+// why the append target is always shorter than the loop index.
 func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 	if r.dispatcher.closed.Load() {
 		return packets
 	}
 	headroom := r.dispatcher.writeback.ReturnHeadroom()
 	now := r.dispatcher.now()
-	unconsumed := packets[:0]
-	var batches []returnBatch
+	var (
+		// pending holds the packets of the first writeback, compacted into the caller's slice.
+		pending        = packets[:0]
+		firstWriteback ForwardWriteback
+		haveWriteback  bool
+		batches        []returnBatch
+		mixed          bool
+		// unconsumed only allocates when a packet is passed back to the caller, which is the
+		// uncommon case; the common path returns a nil slice.
+		unconsumed [][]byte
+	)
 	for _, raw := range packets {
 		decision, writeback := r.classifyReturn(raw, headroom, now)
 		switch decision {
 		case returnWrite:
+			if !mixed {
+				if !haveWriteback {
+					firstWriteback = writeback
+					haveWriteback = true
+				}
+				if writeback == firstWriteback {
+					pending = append(pending, raw)
+					continue
+				}
+				// A second writeback in one batch: build exactly the grouping the previous
+				// implementation built, seeded with everything already classified.
+				mixed = true
+				batches = append(batches, returnBatch{writeback: firstWriteback, packets: pending})
+			}
 			index := slices.IndexFunc(batches, func(batch returnBatch) bool { return batch.writeback == writeback })
 			if index < 0 {
 				batches = append(batches, returnBatch{writeback: writeback})
@@ -960,6 +1000,15 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 		default:
 			unconsumed = append(unconsumed, raw)
 		}
+	}
+	if !mixed {
+		if haveWriteback && len(pending) > 0 {
+			err := firstWriteback.WriteReturnPackets(pending)
+			if err != nil {
+				r.dispatcher.logger.Trace(E.Cause(err, "write return packets"))
+			}
+		}
+		return unconsumed
 	}
 	for _, batch := range batches {
 		err := batch.writeback.WriteReturnPackets(batch.packets)
