@@ -95,6 +95,13 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 	writeback := &countingWriteback{}
 	dispatcher := NewForwardDispatcher(&blockingPortHandler{port: port}, writeback, logger.NOP(), UDPNatOptions{}, 0)
 	t.Cleanup(dispatcher.Close)
+
+	// Whatever happens below, the port must be released: a failure that leaves it blocked would
+	// also leave Close blocked and turn a test failure into a hung binary.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(port.release) }) }
+	t.Cleanup(release)
+
 	stage := dispatcher.NewStage(writeback)
 
 	client := netip.MustParseAddrPort("10.0.0.1:40000")
@@ -114,6 +121,33 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 		t.Fatal("Flush never reached the port")
 	}
 
+	// The data path waits too: a second flow on this stage needs the same lock while the port holds
+	// it. This is checked BEFORE the close below, because Close raises its closed flag before it
+	// takes the lock, and that flag makes Dispatch refuse instead of waiting.
+	dispatchDone := make(chan bool, 1)
+	go func() {
+		dispatchDone <- stage.Dispatch(buildReturnPacket(client, server, []byte("while-blocked")))
+	}()
+	select {
+	case <-dispatchDone:
+		t.Fatal("Dispatch returned while the port was blocking: it does not take the stage lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// ResetNetwork must NOT wait: it is an atomic generation bump, and the table is cleared at the
+	// next Flush. Asserting the negative keeps a future "take the lock to be safe" change from
+	// silently turning reset into a blocking operation.
+	resetDone := make(chan struct{})
+	go func() {
+		dispatcher.ResetNetwork()
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ResetNetwork waited on the stage lock; it should only bump the generation")
+	}
+
 	closeDone := make(chan time.Duration, 1)
 	go func() {
 		start := time.Now()
@@ -127,11 +161,26 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 		// The edge is pinned: Close is behind the port write.
 	}
 
-	close(port.release)
+	// Once Close has started, the closed flag is already up, so a new Dispatch is refused at the
+	// entry check rather than queued behind the lock. Both behaviours matter, and they differ.
+	refused := stage.Dispatch(buildReturnPacket(client, server, []byte("after-close")))
+	if refused {
+		t.Fatal("Dispatch was accepted after Close raised the closed flag")
+	}
+
+	release()
 	select {
 	case <-flushDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Flush did not finish after the port was released")
+	}
+	select {
+	case handled := <-dispatchDone:
+		if !handled {
+			t.Fatal("the queued Dispatch was refused after the lock was released")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queued Dispatch never completed after the port was released")
 	}
 	select {
 	case elapsed := <-closeDone:
@@ -151,7 +200,6 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 		t.Fatalf("the port received %q, want %q", payload, "close-edge")
 	}
 }
-
 // The two interfaces are asserted at compile time so a future change to Port cannot silently make
 // this fixture test something else.
 var (
