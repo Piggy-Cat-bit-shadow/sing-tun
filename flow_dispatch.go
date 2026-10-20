@@ -954,7 +954,10 @@ type returnBatch struct {
 // and leaves the multi-writeback path with the same batches, boundaries and order it had before.
 //
 // The compaction reuses the caller's slice, so it may only write at positions already read; that is
-// why the append target is always shorter than the loop index.
+// why the target index is always at most the loop index. A batch with no dropped or passed packet
+// is left completely untouched: every write would land on the element already there, so the branch
+// below skips it. That keeps the input unmodified on the common path, which is the contract the
+// callers had before this change and the one a shared read-only batch can rely on.
 func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 	if r.dispatcher.closed.Load() {
 		return packets
@@ -962,8 +965,9 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 	headroom := r.dispatcher.writeback.ReturnHeadroom()
 	now := r.dispatcher.now()
 	var (
-		// pending holds the packets of the first writeback, compacted into the caller's slice.
-		pending        = packets[:0]
+		// kept counts the packets of the first writeback, compacted towards the front of the
+		// caller's slice.
+		kept           int
 		firstWriteback ForwardWriteback
 		haveWriteback  bool
 		batches        []returnBatch
@@ -972,7 +976,7 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 		// uncommon case; the common path returns a nil slice.
 		unconsumed [][]byte
 	)
-	for _, raw := range packets {
+	for index, raw := range packets {
 		decision, writeback := r.classifyReturn(raw, headroom, now)
 		switch decision {
 		case returnWrite:
@@ -982,13 +986,18 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 					haveWriteback = true
 				}
 				if writeback == firstWriteback {
-					pending = append(pending, raw)
+					if index != kept {
+						// Only reached after a drop or a pass left a gap, and the target is
+						// always an element already read.
+						packets[kept] = raw
+					}
+					kept++
 					continue
 				}
 				// A second writeback in one batch: build exactly the grouping the previous
 				// implementation built, seeded with everything already classified.
 				mixed = true
-				batches = append(batches, returnBatch{writeback: firstWriteback, packets: pending})
+				batches = append(batches, returnBatch{writeback: firstWriteback, packets: packets[:kept]})
 			}
 			index := slices.IndexFunc(batches, func(batch returnBatch) bool { return batch.writeback == writeback })
 			if index < 0 {
@@ -1002,8 +1011,8 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 		}
 	}
 	if !mixed {
-		if haveWriteback && len(pending) > 0 {
-			err := firstWriteback.WriteReturnPackets(pending)
+		if haveWriteback && kept > 0 {
+			err := firstWriteback.WriteReturnPackets(packets[:kept])
 			if err != nil {
 				r.dispatcher.logger.Trace(E.Cause(err, "write return packets"))
 			}
