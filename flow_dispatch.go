@@ -359,14 +359,15 @@ func (s *ForwardStage) handleHit(entry *flowEntry, packet *forwardPacket, raw []
 		}
 		return true, false
 	case ActionAccept:
-		if packet.protocol == uint8(header.TCPProtocolNumber) {
-			if packet.tcpFlags&header.TCPFlagRst != 0 {
-				return false, true
-			}
-			if packet.tcpFlags&header.TCPFlagSyn == 0 {
-				entry.idle = tcpEstablishedTimeout
-			}
-		} else if packet.protocol == uint8(header.UDPProtocolNumber) {
+		if packet.protocol == uint8(header.TCPProtocolNumber) && packet.tcpFlags&header.TCPFlagSyn == 0 {
+			// The handshake is complete: the stack owns the connection now, so this flow entry
+			// has done its job. Keeping it would retain an accepted TCP connection for the
+			// lifetime of the tunnel. The caller removes it (remove=true) and the packet
+			// continues to the stack. Upstream baaa611, adapted to this dispatcher's two-result
+			// contract.
+			return false, true
+		}
+		if packet.protocol == uint8(header.UDPProtocolNumber) {
 			packet.verdict = entry.verdict
 		}
 		entry.deadline = now + int64(entry.idle)
