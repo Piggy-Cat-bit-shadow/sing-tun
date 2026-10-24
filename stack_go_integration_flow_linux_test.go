@@ -231,8 +231,17 @@ func TestGoKernelZeroWindowHalfClose(t *testing.T) {
 					test.Fatal(err)
 				}
 				unacked, permit := waitClosedWindow(test, server, uint64(len(payload)+1))
-				if server.sentTail.Load() != unacked || server.bufferedTail.Load() != uint64(len(payload)+1) {
-					test.Fatalf("data crossed the closed window: unacked=%d sent=%d buffered=%d permit=%d", unacked, server.sentTail.Load(), server.bufferedTail.Load(), permit)
+				// The SYN window can be larger than the window the peer actually honours,
+				// so bytes may already be in flight when the first acknowledgement shrinks
+				// it. What must not happen is more data being transmitted after the sender
+				// has processed the closed window.
+				sent := server.sentTail.Load()
+				time.Sleep(100 * time.Millisecond)
+				if server.sendPermit.Load()&^goPermitWindowBit != server.sendUnacked.Load() || server.sentTail.Load() != sent {
+					test.Fatalf("sender kept transmitting across the closed window: unacked=%d sent=%d->%d buffered=%d permit=%d", server.sendUnacked.Load(), sent, server.sentTail.Load(), server.bufferedTail.Load(), server.sendPermit.Load()&^goPermitWindowBit)
+				}
+				if server.bufferedTail.Load() <= sent {
+					test.Fatalf("all data was transmitted at unacked=%d sent=%d buffered=%d permit=%d", unacked, sent, server.bufferedTail.Load(), permit)
 				}
 				finEnd, finDropped := dropFinAcknowledgement(traffic, server)
 				err = server.CloseWrite()
@@ -312,8 +321,8 @@ func TestGoKernelZeroWindowHalfClose(t *testing.T) {
 	})
 }
 
-// waitClosedWindow waits until the peer's window stops the sender in the middle of the
-// buffered stream.
+// waitClosedWindow waits until the peer's window stops the sender with data still
+// buffered. Bytes sent under the initial SYN window may still be outstanding.
 func waitClosedWindow(t *testing.T, conn *GoConn, buffered uint64) (uint64, uint64) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -321,7 +330,7 @@ func waitClosedWindow(t *testing.T, conn *GoConn, buffered uint64) (uint64, uint
 		unacked := conn.sendUnacked.Load()
 		permit := conn.sendPermit.Load() &^ goPermitWindowBit
 		closed := permit == unacked && conn.bufferedTail.Load() == buffered &&
-			unacked > 1 && unacked < buffered && conn.sentTail.Load() == unacked
+			unacked > 1 && unacked < buffered && conn.sentTail.Load() < buffered
 		if closed {
 			return unacked, permit
 		}

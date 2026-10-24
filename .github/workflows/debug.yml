@@ -82,7 +82,8 @@ jobs:
             netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow program="$exe" enable=yes profile=any
             if ($LASTEXITCODE -ne 0) { throw "cannot add firewall rule" }
             Write-Host 'firewall rule added'
-            & $exe -test.v -test.count=${{ inputs.count }} -test.timeout=20m -test.run '${{ inputs.test }}' 2>&1 | Tee-Object -FilePath test.log
+            $testArgs = @('-test.v', "-test.count=${{ inputs.count }}", '-test.timeout=20m', "-test.run=${{ inputs.test }}")
+            & $exe @testArgs 2>&1 | Tee-Object -FilePath test.log
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally {
             netsh advfirewall firewall delete rule name="$ruleName" | Out-Host
