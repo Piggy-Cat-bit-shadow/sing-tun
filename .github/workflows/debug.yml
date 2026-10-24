@@ -16,12 +16,13 @@ on:
         required: true
         default: '1'
       firewall:
-        description: Windows only - disable the host firewall before testing
+        description: Windows only - host firewall handling before testing
         required: true
         type: choice
         options:
           - keep
           - disable
+          - rule
 
 permissions:
   contents: read
@@ -69,8 +70,25 @@ jobs:
             flags="-exec sudo"
           fi
           go test -v -count=${{ inputs.count }} $flags -timeout=20m -run '${{ inputs.test }}' . 2>&1 | tee /tmp/test.log
+      - name: Test (windows, program firewall rule)
+        if: runner.os == 'Windows' && inputs.firewall == 'rule'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'tun-kernel.test.exe'
+          go test -c -o $exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ruleName = "sing-tun kernel test $env:GITHUB_RUN_ID"
+          try {
+            netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow program="$exe" enable=yes profile=any
+            if ($LASTEXITCODE -ne 0) { throw "cannot add firewall rule" }
+            Write-Host 'firewall rule added'
+            & $exe -test.v -test.count=${{ inputs.count }} -test.timeout=20m -test.run '${{ inputs.test }}' 2>&1 | Tee-Object -FilePath test.log
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            netsh advfirewall firewall delete rule name="$ruleName" | Out-Host
+          }
       - name: Test (windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.firewall != 'rule'
         shell: pwsh
         run: |
           go test -v -count=${{ inputs.count }} -timeout=20m -run '${{ inputs.test }}' . 2>&1 | Tee-Object -FilePath test.log
