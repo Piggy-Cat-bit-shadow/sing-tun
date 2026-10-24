@@ -1,0 +1,27 @@
+name: linux-tun-verify
+
+# Manual gate for the parts of the Linux TUN path that only a real kernel can answer: the
+# no-auto-route IPv6 oif rule and ::/0 route, two real TUN devices coexisting, and cleanup on Close.
+# The test skips for ordinary users, so the normal push gate does not run it; dispatch this workflow
+# to run it as root on a runner that has /dev/net/tun.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Linux unit tests (non-root)
+        run: |
+          go test -count=1 -v -timeout 5m \
+            -run 'TestNextIPv6RulePriority|TestRoutes|TestTwoTunInstances|TestTCPNat|TestMemoryTun|TestSlowJudgement|TestJudgement|TestDispatcher' .
+      - name: Build test binary
+        run: go test -c -vet=off -o /tmp/tun-linux.test .
+      - name: Real dual-TUN rule/route lifecycle (root)
+        run: sudo /tmp/tun-linux.test -test.run '^TestPrivilegedDualTunIPv6RuleAndRouteLifecycle$' -test.v -test.timeout 60s
