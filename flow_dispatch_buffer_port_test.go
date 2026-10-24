@@ -132,7 +132,7 @@ func TestForwardStageKeepsBorrowedPathForPlainPort(t *testing.T) {
 func TestForwardDispatcherCloseReleasesStagedOwnedBuffers(t *testing.T) {
 	port := &packetBufferPortStub{headroom: 9}
 	dispatcher := &ForwardDispatcher{epoch: time.Now(), logger: logger.NOP()}
-	stage := dispatcher.NewStage(nil)
+	stage := dispatcher.NewStage(nil, nil)
 	stage.stagePort(&portNAT{port: port}, []byte{0x45, 0, 0, 20})
 	if len(stage.ports[0].buffers) != 1 {
 		t.Fatal("the packet was not staged as an owned buffer")

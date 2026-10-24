@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -61,7 +62,7 @@ func TestSystemAcceptLoopRecoversFromUnexpectedAcceptError(t *testing.T) {
 	// A new flow arriving on the restored listener must be accepted and dispatched, not refused.
 	// LookupBack matches on the source port, so the fake connection reports the NAT-allocated
 	// local address, which is what a real accepted connection reports.
-	session := tcpNat.Lookup(netip.MustParseAddrPort("10.0.0.2:40000"), netip.MustParseAddrPort("93.184.216.34:443"))
+	session := tcpNat.Lookup(netip.MustParseAddrPort("10.0.0.2:40000"), netip.MustParseAddrPort("93.184.216.34:443"), header.TCPFlagSyn)
 	require.NotZero(t, session)
 	conn, peer := net.Pipe()
 	t.Cleanup(func() {

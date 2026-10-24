@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing-tun/gtcpip/header"
 )
 
 // The close-dependency edge, pinned as a regression test.
@@ -102,12 +102,24 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(port.release) }) }
 	t.Cleanup(release)
 
-	stage := dispatcher.NewStage(writeback)
+	// The verdict runs on its own goroutine now; the pump applies it, exactly like a real stack.
+	// judged tells the test when the first flow has been installed and its packet staged.
+	var stage *ForwardStage
+	judged := make(chan struct{}, 1)
+	stage = dispatcher.NewStage(writeback, func() {
+		stage.ResumeJudged(func([]byte, ForwardFrameMeta) {})
+		judged <- struct{}{}
+	})
 
 	client := netip.MustParseAddrPort("10.0.0.1:40000")
 	server := netip.MustParseAddrPort("93.184.216.34:443")
 	if !stage.Dispatch(buildReturnPacket(client, server, []byte("close-edge"))) {
 		t.Fatal("dispatch refused the packet")
+	}
+	select {
+	case <-judged:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the judgement was never applied to the stage")
 	}
 
 	flushDone := make(chan struct{})
@@ -200,6 +212,7 @@ func TestDispatcherCloseWaitsForAnInFlightPortWrite(t *testing.T) {
 		t.Fatalf("the port received %q, want %q", payload, "close-edge")
 	}
 }
+
 // The two interfaces are asserted at compile time so a future change to Port cannot silently make
 // this fixture test something else.
 var (

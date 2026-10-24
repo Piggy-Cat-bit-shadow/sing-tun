@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"bytes"
 	"encoding/binary"
 	"maps"
 	"net/netip"
@@ -33,6 +34,13 @@ const (
 
 	flowSweepInterval = 30 * time.Second
 	flowSweepLimit    = flowTableCapacity / int(flowTombstoneTimeout/flowSweepInterval)
+
+	// flowHoldCapacity bounds the packets (and therefore the judgements) a stage may park while a
+	// flow is being judged, and flowHoldPerFlow bounds what one flow may park. A slow JudgeFlow
+	// must not be able to grow the stage without bound, so packets beyond the bound are dropped
+	// by the stage that could not hold them, not queued somewhere else.
+	flowHoldCapacity = 512
+	flowHoldPerFlow  = 16
 )
 
 type ForwardWriteback interface {
@@ -172,10 +180,17 @@ type stagedPort struct {
 type ForwardStage struct {
 	dispatcher *ForwardDispatcher
 	writeback  ForwardWriteback
-	access     sync.Mutex
-	table      map[flowKey]*flowEntry
-	lastSweep  int64
-	resetSeen  uint32
+	// resume wakes the stack's packet loop so it drains judged flows. The judgement itself runs on
+	// its own goroutine; only this callback re-enters the loop, which keeps the lock order
+	// stage.access -> loop -> stage.access impossible.
+	resume    func()
+	access    sync.Mutex
+	table     map[flowKey]*flowEntry
+	judging   map[flowKey]*flowJudgement
+	judged    []*flowJudgement
+	held      int
+	lastSweep int64
+	resetSeen uint32
 
 	exhaustedLogAt int64
 	ports          []stagedPort
@@ -183,6 +198,21 @@ type ForwardStage struct {
 	segmentBuffers [][]byte
 	segmentSizes   []int
 	segmentUsed    int
+}
+
+// heldPacket is one packet parked while its flow is judged. The bytes are a private copy: the
+// caller may reuse the frame as soon as Dispatch returns, because the whole point of the async
+// path is that Dispatch does not wait for the verdict.
+type heldPacket struct {
+	packet          []byte
+	transportLength int
+	meta            ForwardFrameMeta
+}
+
+type flowJudgement struct {
+	key     flowKey
+	packets []heldPacket
+	verdict FlowVerdict
 }
 
 func addrToTCPIP(addr netip.Addr) tcpip.Address {
@@ -213,7 +243,7 @@ func NewForwardDispatcher(handler Handler, writeback ForwardWriteback, logger lo
 	return dispatcher
 }
 
-func (d *ForwardDispatcher) NewStage(writeback ForwardWriteback) *ForwardStage {
+func (d *ForwardDispatcher) NewStage(writeback ForwardWriteback, resume func()) *ForwardStage {
 	if d == nil {
 		return nil
 	}
@@ -223,7 +253,9 @@ func (d *ForwardDispatcher) NewStage(writeback ForwardWriteback) *ForwardStage {
 	stage := &ForwardStage{
 		dispatcher: d,
 		writeback:  writeback,
+		resume:     resume,
 		table:      make(map[flowKey]*flowEntry),
+		judging:    make(map[flowKey]*flowJudgement),
 		resetSeen:  d.resetGeneration.Load(),
 	}
 	d.stagesAccess.Lock()
@@ -250,6 +282,12 @@ func (d *ForwardDispatcher) Close() {
 		for key, entry := range stage.table {
 			stage.removeEntry(key, entry, FlowCloseReset)
 		}
+		// Judgements that have not resumed yet own private packet copies. Dropping them here is
+		// what makes Close bounded: the judge goroutine may still be inside JudgeFlow, and it must
+		// find its judgement gone when it returns instead of re-installing a flow after close.
+		clear(stage.judging)
+		stage.judged = nil
+		stage.held = 0
 		// A stage closed with owned packets still staged would otherwise leak them: Flush returns
 		// early once the dispatcher is closed. The release is under the same lock Flush takes for
 		// the port loop, so a Flush that already passed the closed check cannot hand a buffer to
@@ -296,6 +334,7 @@ func (s *ForwardStage) dispatch(packet []byte, parsed *forwardPacket, meta *Forw
 	key := parsed.flowKey()
 	now := s.dispatcher.now()
 	s.access.Lock()
+	defer s.access.Unlock()
 	entry, loaded := s.table[key]
 	if loaded {
 		if entryExpired(entry, now) {
@@ -305,16 +344,119 @@ func (s *ForwardStage) dispatch(packet []byte, parsed *forwardPacket, meta *Forw
 			if remove {
 				s.removeEntry(key, entry, FlowCloseReset)
 			}
-			s.access.Unlock()
 			return handled
 		}
 	}
-	s.access.Unlock()
+	judgement, judging := s.judging[key]
+	if judging {
+		// The verdict for this flow is still running. Park a copy of the packet in order, bounded
+		// per flow, so the packets that triggered the judgement are not reordered behind the ones
+		// that follow, and report it consumed: the resume path owns it from here.
+		if len(judgement.packets) < flowHoldPerFlow {
+			s.hold(judgement, packet, parsed, meta)
+		}
+		return true
+	}
 	if parsed.protocol == uint8(header.TCPProtocolNumber) &&
 		(parsed.tcpFlags&header.TCPFlagSyn == 0 || parsed.tcpFlags&header.TCPFlagAck != 0) {
 		return false
 	}
-	return s.judgeAndInstall(key, parsed, packet, meta)
+	judgement = &flowJudgement{key: key}
+	if !s.hold(judgement, packet, parsed, meta) {
+		// The stage is already holding its whole budget for other judgements. Dropping this
+		// packet keeps the bound; queueing it would not.
+		return true
+	}
+	s.judging[key] = judgement
+	var firstPacket []byte
+	if parsed.protocol == uint8(header.UDPProtocolNumber) {
+		// firstPacket is handed to JudgeFlow after Dispatch has returned, so it must not alias a
+		// caller-owned frame.
+		firstPacket = bytes.Clone(header.UDP(parsed.transport).Payload())
+	}
+	// Judge off the packet path. The verdict is applied by the stack's resume pump, or, for a
+	// stage without one, by judge itself; either way the caller's frame is never touched again.
+	go s.judge(judgement, firstPacket)
+	return true
+}
+
+// hold copies one packet into judgement. It reports false when the stage budget is already used
+// up; that is a deliberate drop, not an error.
+func (s *ForwardStage) hold(judgement *flowJudgement, packet []byte, parsed *forwardPacket, meta *ForwardFrameMeta) bool {
+	if s.held >= flowHoldCapacity {
+		return false
+	}
+	held := heldPacket{
+		packet:          bytes.Clone(packet),
+		transportLength: len(parsed.transport),
+	}
+	if meta != nil {
+		held.meta = *meta
+	}
+	judgement.packets = append(judgement.packets, held)
+	s.held++
+	return true
+}
+
+func (s *ForwardStage) judge(judgement *flowJudgement, firstPacket []byte) {
+	key := judgement.key
+	verdict := s.dispatcher.handler.JudgeFlow(key.protocol, key.source, key.destination, firstPacket)
+	if verdict.Action == ActionBypass && verdict.Port != nil {
+		verdict.Action = ActionFlow
+	}
+	s.access.Lock()
+	if s.judging[key] != judgement {
+		// Close (or Flush) dropped the judgement while JudgeFlow was running. The packets are
+		// already released; do not install a flow into a closed stage.
+		s.access.Unlock()
+		return
+	}
+	judgement.verdict = verdict
+	s.judged = append(s.judged, judgement)
+	s.access.Unlock()
+	if s.resume != nil {
+		s.resume()
+	} else {
+		s.ResumeJudged(func([]byte, ForwardFrameMeta) {})
+	}
+}
+
+// ResumeJudged installs every completed judgement in order and hands the packets that are not
+// consumed by an installed flow to process.
+//
+// process runs without the stage lock: an installed ACCEPT flow means the packet belongs to the
+// stack, and the stack may itself call back into this stage while processing it.
+func (s *ForwardStage) ResumeJudged(process func(packet []byte, meta ForwardFrameMeta)) {
+	var unhandled []heldPacket
+	s.access.Lock()
+	if s.dispatcher.closed.Load() {
+		s.access.Unlock()
+		return
+	}
+	now := s.dispatcher.now()
+	for _, judgement := range s.judged {
+		delete(s.judging, judgement.key)
+		s.held -= len(judgement.packets)
+		for index := range judgement.packets {
+			held := &judgement.packets[index]
+			parsed, parsedOK := parseForwardPacket(held.packet)
+			if !parsedOK {
+				continue
+			}
+			if held.transportLength <= len(parsed.transport) {
+				parsed.transport = parsed.transport[:held.transportLength]
+			}
+			if !s.install(judgement.key, &parsed, held.packet, &held.meta, judgement.verdict, now) {
+				unhandled = append(unhandled, *held)
+			}
+		}
+	}
+	clear(s.judged)
+	s.judged = s.judged[:0]
+	s.access.Unlock()
+	for _, held := range unhandled {
+		process(held.packet, held.meta)
+	}
 }
 
 func (s *ForwardStage) teardownFlow(key flowKey, reason FlowCloseReason) {
@@ -382,22 +524,14 @@ func (s *ForwardStage) handleHit(entry *flowEntry, packet *forwardPacket, raw []
 	}
 }
 
-func (s *ForwardStage) judgeAndInstall(key flowKey, packet *forwardPacket, raw []byte, meta *ForwardFrameMeta) bool {
+// install applies a verdict to a flow. The caller holds stage.access: it is the second half of
+// ResumeJudged, which has already removed the judgement and must decide and stage atomically with
+// respect to a concurrent Flush or Close.
+func (s *ForwardStage) install(key flowKey, packet *forwardPacket, raw []byte, meta *ForwardFrameMeta, verdict FlowVerdict, now int64) bool {
 	d := s.dispatcher
-	var firstPacket []byte
-	if packet.protocol == uint8(header.UDPProtocolNumber) {
-		firstPacket = header.UDP(packet.transport).Payload()
-	}
-	verdict := d.handler.JudgeFlow(packet.protocol, packet.source, packet.destination, firstPacket)
-	if verdict.Action == ActionBypass && verdict.Port != nil {
-		verdict.Action = ActionFlow
-	}
-	s.access.Lock()
-	defer s.access.Unlock()
 	if d.closed.Load() {
 		return false
 	}
-	now := d.now()
 	existing, loaded := s.table[key]
 	if loaded {
 		if entryExpired(existing, now) {
@@ -462,10 +596,38 @@ func (s *ForwardStage) installSimple(key flowKey, action FlowAction, protocol ui
 
 func (s *ForwardStage) installAccept(key flowKey, packet *forwardPacket, verdict FlowVerdict, now int64) {
 	entry := s.installSimple(key, ActionAccept, packet.protocol, now)
+	// The verdict is recorded for every protocol: the gvisor forwarders ask the dispatcher for the
+	// verdict this flow already got through the tunnel, so they do not judge the same flow twice
+	// and get a different answer.
+	entry.verdict = verdict
 	if packet.protocol == uint8(header.UDPProtocolNumber) {
-		entry.verdict = verdict
 		packet.verdict = verdict
 	}
+}
+
+// acceptedVerdict returns the verdict already recorded for an accepted flow, if this dispatcher has
+// one. It lets the gvisor-side forwarders (TCP, UDP and ICMP) reuse the decision the tunnel flow
+// made instead of calling JudgeFlow a second time.
+func (d *ForwardDispatcher) acceptedVerdict(protocol uint8, source netip.AddrPort, destination netip.AddrPort) (FlowVerdict, bool) {
+	if d == nil || d.closed.Load() {
+		return FlowVerdict{}, false
+	}
+	key := flowKey{protocol: protocol, source: source, destination: destination}
+	now := d.now()
+	d.stagesAccess.Lock()
+	stages := d.stages
+	d.stagesAccess.Unlock()
+	for _, stage := range stages {
+		stage.access.Lock()
+		entry, loaded := stage.table[key]
+		if loaded && entry.action == ActionAccept && !entryExpired(entry, now) {
+			verdict := entry.verdict
+			stage.access.Unlock()
+			return verdict, true
+		}
+		stage.access.Unlock()
+	}
+	return FlowVerdict{}, false
 }
 
 func (d *ForwardDispatcher) idleTimeout(protocol uint8, established bool) time.Duration {

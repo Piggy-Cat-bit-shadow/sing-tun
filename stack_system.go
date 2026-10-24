@@ -76,11 +76,16 @@ type System struct {
 	recoveredListeners atomic.Uint64
 	// recreateListener replaces the accept loop's listener-bind step. It is nil in production
 	// (the bind is used directly) and only set by tests that need to drive a bind failure.
-	recreateListener    func() (net.Listener, error)
-	udpNat              *UDPNat
-	udpNATOptions       UDPNatOptions
-	dispatcher          *ForwardDispatcher
-	dispatchStage       *ForwardStage
+	recreateListener func() (net.Listener, error)
+	udpNat           *UDPNat
+	udpNATOptions    UDPNatOptions
+	dispatcher       *ForwardDispatcher
+	dispatchStage    *ForwardStage
+	// processAccess serialises the packet loop with resumeJudged: a judgement completes on its own
+	// goroutine and has to re-enter the stack's packet path, which is not concurrency-safe. The
+	// loop holds it across process+Flush, so a resumed packet is ordered after the frame that was
+	// being processed, never in the middle of it.
+	processAccess       sync.Mutex
 	bindInterface       bool
 	interfaceFinder     control.InterfaceFinder
 	frontHeadroom       int
@@ -267,9 +272,40 @@ func (s *System) start() error {
 	}
 	if s.handler != nil {
 		s.dispatcher = NewForwardDispatcher(s.handler, newSystemWriteback(s.tun, s.frontHeadroom), s.logger, s.udpNATOptions, s.icmpTimeout)
-		s.dispatchStage = s.dispatcher.NewStage(nil)
+		s.dispatchStage = s.dispatcher.NewStage(nil, func() { s.resumeJudged(s.processPacket) })
 	}
 	return nil
+}
+
+// resumeJudged applies completed flow judgements on the packet loop's own goroutine. It holds
+// processAccess for the same reason the loop does: the packets it hands to processPacket travel the
+// same path a read frame would, and they must not interleave with one.
+//
+// A packet that processPacket declines to write back but that the judgement did not install a flow
+// for is dropped here; that is the same outcome it had before the dispatcher consumed it.
+func (s *System) resumeJudged(process func(packet []byte) bool) {
+	s.processAccess.Lock()
+	defer s.processAccess.Unlock()
+	if s.dispatchStage == nil {
+		return
+	}
+	writeback := s.dispatchStage.writeback
+	headroom := writeback.ReturnHeadroom()
+	var writeBuffers [][]byte
+	s.dispatchStage.ResumeJudged(func(packet []byte, _ ForwardFrameMeta) {
+		buffer := make([]byte, headroom+len(packet))
+		copy(buffer[headroom:], packet)
+		if process(buffer[headroom:]) {
+			writeBuffers = append(writeBuffers, buffer)
+		}
+	})
+	if len(writeBuffers) > 0 {
+		err := writeback.WriteReturnPackets(writeBuffers)
+		if err != nil {
+			s.logger.Trace(E.Cause(err, "write packet"))
+		}
+	}
+	s.dispatchStage.Flush()
 }
 
 func (s *System) tunLoop() {
@@ -309,6 +345,7 @@ func (s *System) tunLoop() {
 		}
 		rawPacket := packetBuffer[:n]
 		packet := packetBuffer[PacketOffset:n]
+		s.processAccess.Lock()
 		if s.processPacket(packet) {
 			_, err = s.tun.Write(rawPacket)
 			if err != nil {
@@ -316,6 +353,7 @@ func (s *System) tunLoop() {
 			}
 		}
 		s.dispatchStage.Flush()
+		s.processAccess.Unlock()
 	}
 }
 
@@ -329,6 +367,7 @@ func (s *System) wintunLoop(winTun WinTun) {
 			release()
 			continue
 		}
+		s.processAccess.Lock()
 		if s.processPacket(packet) {
 			_, err = winTun.Write(packet)
 			if err != nil {
@@ -336,6 +375,7 @@ func (s *System) wintunLoop(winTun WinTun) {
 			}
 		}
 		s.dispatchStage.Flush()
+		s.processAccess.Unlock()
 		release()
 	}
 }
@@ -365,6 +405,7 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 		if n == 0 {
 			continue
 		}
+		s.processAccess.Lock()
 		for i := range n {
 			packetSize := packetSizes[i]
 			if packetSize < header.IPv4MinimumSize {
@@ -384,6 +425,7 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 			writeBuffers = writeBuffers[:0]
 		}
 		s.dispatchStage.Flush()
+		s.processAccess.Unlock()
 	}
 }
 
@@ -410,6 +452,7 @@ func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
 		}
 		writeBuffers = writeBuffers[:0]
 		releaseBuffers = releaseBuffers[:0]
+		s.processAccess.Lock()
 		for _, buffer := range buffers {
 			packetSize := buffer.Len()
 			if packetSize < header.IPv4MinimumSize {
@@ -430,6 +473,7 @@ func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
 			buf.ReleaseMulti(writeBuffers)
 		}
 		s.dispatchStage.Flush()
+		s.processAccess.Unlock()
 		buf.ReleaseMulti(releaseBuffers)
 	}
 }
@@ -522,7 +566,9 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat, network strin
 			continue
 		}
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
-		session := tcpNat.LookupBack(connPort)
+		// The handshake reached the stack, so this is the reverse side of the session: a SYN here
+		// is not a new forward connection and must not revive a closed mapping.
+		session := tcpNat.LookupBack(connPort, 0)
 		if session == nil {
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
@@ -689,7 +735,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpListenerPort(false) {
-		session := s.tcpNat4.LookupBack(destination.Port())
+		session := s.tcpNat4.LookupBack(destination.Port(), tcpHdr.Flags())
 		if session == nil {
 			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
 		}
@@ -708,7 +754,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort := s.tcpNat4.Lookup(source, destination)
+			natPort := s.tcpNat4.Lookup(source, destination, tcpHdr.Flags())
 			if natPort == 0 {
 				return false, E.New("ipv4: tcp: NAT port space exhausted")
 			}
@@ -732,7 +778,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpListenerPort(true) {
-		session := s.tcpNat6.LookupBack(destination.Port())
+		session := s.tcpNat6.LookupBack(destination.Port(), tcpHdr.Flags())
 		if session == nil {
 			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
 		}
@@ -751,7 +797,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort := s.tcpNat6.Lookup(source, destination)
+			natPort := s.tcpNat6.Lookup(source, destination, tcpHdr.Flags())
 			if natPort == 0 {
 				return false, E.New("ipv6: tcp: NAT port space exhausted")
 			}

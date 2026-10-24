@@ -35,7 +35,6 @@ type NativeTun struct {
 	iovecsOutputDefault []unix.Iovec
 	interfaceCallback   *list.Element[DefaultInterfaceUpdateCallback]
 	options             Options
-	ruleIndex6          []int
 	readAccess          sync.Mutex
 	writeAccess         sync.Mutex
 	vnetHdr             bool
@@ -732,6 +731,13 @@ func (t *NativeTun) routes(tunLink netlink.Link) ([]netlink.Route, error) {
 	if err != nil {
 		return nil, E.Cause(err, "build auto route ranges")
 	}
+	// An IPv6 address without auto route still needs the default route in this tun's own table:
+	// the rule created for it sends every IPv6 packet to that table, and a table with only the
+	// interface's own prefix would blackhole everything else. It is scoped to the table, so a
+	// second TUN with its own table is unaffected.
+	if !t.options.AutoRoute && len(t.options.Inet6Address) > 0 && len(t.options.Inet6RouteAddress) == 0 {
+		routeRanges = append(routeRanges, netip.PrefixFrom(netip.IPv6Unspecified(), 0))
+	}
 	// Do not create gateway on linux by default
 	gateway4, gateway6 := t.options.Inet4GatewayAddr(), t.options.Inet6GatewayAddr()
 	return common.Map(routeRanges, func(it netip.Prefix) netlink.Route {
@@ -750,31 +756,62 @@ func (t *NativeTun) routes(tunLink netlink.Link) ([]netlink.Route, error) {
 	}), nil
 }
 
+// nextIndex6 returns the priority for the IPv6 rule that sends traffic for this tun into its own
+// route table. The rule must stay below every rule the instance did not create (so an existing
+// lower-priority rule keeps winning) but above the auto-redirect rules this package owns, which
+// are the ones it must never shadow.
+//
+// The previous implementation decremented past the lowest rule in the system and recorded the
+// result in ruleIndex6. That ignored redirectRouteRulePriority, so a fresh instance could insert
+// itself in front of the redirect rules, and it made cleanup depend on process-local state: a
+// restart deleted rules by a priority the new process did not own.
 func (t *NativeTun) nextIndex6() int {
 	ruleList, err := netlink.RuleList(netlink.FAMILY_V6)
 	if err != nil {
 		return -1
 	}
+	return nextIPv6RulePriority(ruleList)
+}
+
+// nextIPv6RulePriority is the pure part of nextIndex6, so the multi-instance behaviour can be
+// tested without a live rule table.
+func nextIPv6RulePriority(rules []netlink.Rule) int {
 	var minIndex int
-	for _, rule := range ruleList {
-		if rule.Priority > 0 && (minIndex == 0 || rule.Priority < minIndex) {
-			minIndex = rule.Priority
+	for index := range rules {
+		priority := rules[index].Priority
+		if priority > redirectRouteRulePriority && (minIndex == 0 || priority < minIndex) {
+			minIndex = priority
 		}
 	}
-	minIndex--
-	t.ruleIndex6 = append(t.ruleIndex6, minIndex)
-	return minIndex
+	return max(minIndex-1, redirectRouteRulePriority+1)
+}
+
+// ipv6Rule builds the no-auto-route IPv6 rule. Its identity is the pair (output interface, table):
+// two TUN instances differ in both, so neither can shadow the other's rule. The priority only
+// orders this rule against rules it did not create.
+func (t *NativeTun) ipv6Rule(priority int) *netlink.Rule {
+	rule := netlink.NewRule()
+	rule.Priority = priority
+	rule.Table = t.options.IPRoute2TableIndex
+	rule.Family = unix.AF_INET6
+	rule.OifName = t.options.Name
+	return rule
+}
+
+// ipv6RuleDelete is the identity cleanup uses. It deliberately does not include the priority: the
+// priority is derived from the live rule table and may change between the create and the delete.
+func (t *NativeTun) ipv6RuleDelete() *netlink.Rule {
+	rule := netlink.NewRule()
+	rule.Family = unix.AF_INET6
+	rule.OifName = t.options.Name
+	rule.Table = t.options.IPRoute2TableIndex
+	return rule
 }
 
 func (t *NativeTun) rules() []*netlink.Rule {
 	if !t.options.AutoRoute {
 		if len(t.options.Inet6Address) > 0 {
-			it := netlink.NewRule()
-			it.Priority = t.nextIndex6()
-			it.Table = t.options.IPRoute2TableIndex
-			it.Family = unix.AF_INET6
-			it.OifName = t.options.Name
-			return []*netlink.Rule{it}
+			return []*netlink.Rule{t.ipv6Rule(t.nextIndex6())}
 		}
 		return nil
 	}
@@ -1237,17 +1274,14 @@ func (t *NativeTun) unsetRules() error {
 	if t.options.FileDescriptor > 0 {
 		return nil
 	}
-	if len(t.ruleIndex6) > 0 {
-		for _, index := range t.ruleIndex6 {
-			ruleToDel := netlink.NewRule()
-			ruleToDel.Family = unix.AF_INET6
-			ruleToDel.Priority = index
-			err := netlink.RuleDel(ruleToDel)
-			if err != nil {
-				return E.Cause(err, "unset rule6 ", index)
-			}
+	if !t.options.AutoRoute && len(t.options.Inet6Address) > 0 && t.options.IPRoute2TableIndex != 0 {
+		// Delete by the rule's own identity (family, output interface, table) instead of a
+		// remembered priority: the rule this instance created is exactly the one for its table on
+		// its interface, and a missing rule is not an error on a repeated cleanup.
+		err := netlink.RuleDel(t.ipv6RuleDelete())
+		if err != nil && !errors.Is(err, unix.ENOENT) {
+			return E.Cause(err, "unset rule6")
 		}
-		t.ruleIndex6 = nil
 	}
 	if t.options.AutoRoute {
 		ruleList, err := netlink.RuleList(netlink.FAMILY_ALL)
