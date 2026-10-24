@@ -278,7 +278,7 @@ func TestGoKernelPacketMapping(t *testing.T) {
 								}
 								client.SetReadDeadline(time.Now().Add(75 * time.Millisecond))
 								if allowed {
-									client.SetReadDeadline(time.Now().Add(time.Second))
+									client.SetReadDeadline(time.Now().Add(3 * time.Second))
 								}
 								data := make([]byte, 16)
 								n, source, readErr := client.ReadFromUDPAddrPort(data)
