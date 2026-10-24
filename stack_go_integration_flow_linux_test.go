@@ -204,83 +204,190 @@ func TestGoKernelSACKReneging(t *testing.T) {
 }
 
 func TestGoKernelZeroWindowHalfClose(t *testing.T) {
-	for _, ipv6 := range []bool{false, true} {
-		t.Run(fmt.Sprintf("ipv6=%v", ipv6), func(test *testing.T) {
-			test.Parallel()
-			config := kernelStackConfig{mtu: 9000, socketBuffer: 512}
-			config.dialer = net.Dialer{Control: func(_, _ string, rawConn syscall.RawConn) error {
-				var optionErr error
-				err := rawConn.Control(func(descriptor uintptr) {
-					optionErr = unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_RCVBUF, 512)
-					if optionErr == nil {
-						optionErr = unix.SetsockoptInt(int(descriptor), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, 1024)
-					}
-				})
-				return E.Errors(err, optionErr)
-			}}
-			fixture, traffic := newKernelTCPFixture(test, config, kernelTCPConfig{})
-			client, server := fixture.pair(test, ipv6)
-			payload := kernelPayload(int(server.sendPermit.Load()&^goPermitWindowBit-1), 139)
-			_, err := server.Write(payload)
-			if err != nil {
-				test.Fatal(err)
+	config := kernelStackConfig{mtu: 9000, socketBuffer: 512}
+	config.dialer = net.Dialer{Control: func(_, _ string, rawConn syscall.RawConn) error {
+		var optionErr error
+		err := rawConn.Control(func(descriptor uintptr) {
+			optionErr = unix.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_RCVBUF, 512)
+			if optionErr == nil {
+				optionErr = unix.SetsockoptInt(int(descriptor), unix.IPPROTO_TCP, unix.TCP_WINDOW_CLAMP, 1024)
 			}
-			deadline := time.Now().Add(time.Second)
-			for time.Now().Before(deadline) {
-				if server.sendUnacked.Load() == uint64(len(payload)+1) && server.sendPermit.Load()&^goPermitWindowBit == server.sendUnacked.Load() {
-					break
+		})
+		return E.Errors(err, optionErr)
+	}}
+	// The peer socket deliberately keeps a tiny receive buffer, so the sender has to
+	// stop in the middle of a stream and wait for the application to read before it can
+	// deliver the rest and the FIN. The closed window is a property of the peer's buffer,
+	// not of a stalled write, so every phase below waits for the state it verifies.
+	t.Run("blocked-data", func(scenario *testing.T) {
+		for _, ipv6 := range []bool{false, true} {
+			scenario.Run(fmt.Sprintf("ipv6=%v", ipv6), func(test *testing.T) {
+				test.Parallel()
+				fixture, traffic := newKernelTCPFixture(test, config, kernelTCPConfig{})
+				client, server := fixture.pair(test, ipv6)
+				payload := kernelPayload(8<<10, 139)
+				_, err := server.Write(payload)
+				if err != nil {
+					test.Fatal(err)
 				}
-				time.Sleep(time.Millisecond)
-			}
-			if server.sendUnacked.Load() != uint64(len(payload)+1) || server.sendPermit.Load()&^goPermitWindowBit != server.sendUnacked.Load() {
-				test.Fatalf("window did not close after acknowledging all data: length=%d unacked=%d permit=%d", len(payload), server.sendUnacked.Load(), server.sendPermit.Load()&^goPermitWindowBit)
-			}
-			finAcknowledgement := func(event kernelTCPEvent) bool {
-				return !event.outgoing && event.flags&header.TCPFlagAck != 0 && event.ack == uint64(len(payload)+2)
-			}
-			traffic.setFilter(server, func(event kernelTCPEvent) kernelTCPAction {
-				return kernelTCPAction{drop: finAcknowledgement(event)}
+				unacked, permit := waitClosedWindow(test, server, uint64(len(payload)+1))
+				if server.sentTail.Load() != unacked || server.bufferedTail.Load() != uint64(len(payload)+1) {
+					test.Fatalf("data crossed the closed window: unacked=%d sent=%d buffered=%d permit=%d", unacked, server.sentTail.Load(), server.bufferedTail.Load(), permit)
+				}
+				finEnd, finDropped := dropFinAcknowledgement(traffic, server)
+				err = server.CloseWrite()
+				if err != nil {
+					test.Fatal(err)
+				}
+				// The FIN is behind data that the closed window still holds back, so it
+				// must not be sent on its own.
+				time.Sleep(50 * time.Millisecond)
+				if flow := traffic.snapshot(server.key); flow.fin != 0 {
+					test.Fatalf("FIN sent at %d while %d bytes of data were blocked by the closed window", flow.fin, server.bufferedTail.Load()-unacked)
+				}
+				verifyZeroWindowHalfClose(test, client, server, traffic, make([]byte, len(payload)), payload, finEnd, finDropped)
 			})
-			err = server.CloseWrite()
-			if err != nil {
-				test.Fatal(err)
-			}
-			traffic.await(test, server, "FIN sent with zero receive window", func(flow kernelTCPFlow) bool {
-				return flow.fin != 0 && flow.peerWindow == 0
+		}
+	})
+	// A FIN occupies sequence space, so when the peer's window closes exactly at the end
+	// of the data the FIN has to wait for a window update instead of being sent beyond
+	// the advertised right edge.
+	t.Run("fin-at-window-edge", func(scenario *testing.T) {
+		for _, ipv6 := range []bool{false, true} {
+			scenario.Run(fmt.Sprintf("ipv6=%v", ipv6), func(test *testing.T) {
+				test.Parallel()
+				fixture, traffic := newKernelTCPFixture(test, config, kernelTCPConfig{})
+				client, server := fixture.pair(test, ipv6)
+				const windowProbe = 0x5a
+				_, err := server.Write([]byte{windowProbe})
+				if err != nil {
+					test.Fatal(err)
+				}
+				// The SYN carries the peer's initial window; the first acknowledgement
+				// advertises the window the peer will actually honour. Size the payload
+				// from that value so it fills the window exactly.
+				traffic.await(test, server, "peer window after the first byte", func(flow kernelTCPFlow) bool {
+					return server.sendUnacked.Load() >= 2 && server.sendPermit.Load()&^goPermitWindowBit > server.sendUnacked.Load()
+				})
+				unacked := server.sendUnacked.Load()
+				permit := server.sendPermit.Load() &^ goPermitWindowBit
+				window := permit - unacked
+				if window == 0 || window > 1<<20 {
+					test.Fatalf("unexpected peer window %d", window)
+				}
+				payload := kernelPayload(int(window), 139)
+				_, err = server.Write(payload)
+				if err != nil {
+					test.Fatal(err)
+				}
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					if server.sendUnacked.Load() == permit && server.sendPermit.Load()&^goPermitWindowBit == permit && server.sentTail.Load() == permit && server.bufferedTail.Load() == permit {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if server.sendUnacked.Load() != permit || server.sendPermit.Load()&^goPermitWindowBit != permit || server.sentTail.Load() != permit || server.bufferedTail.Load() != permit {
+					test.Fatalf("window did not close at the end of the data: unacked=%d sent=%d buffered=%d permit=%d", server.sendUnacked.Load(), server.sentTail.Load(), server.bufferedTail.Load(), server.sendPermit.Load()&^goPermitWindowBit)
+				}
+				if flow := traffic.snapshot(server.key); flow.peerWindow != 0 {
+					test.Fatalf("peer window is %d, expected the buffer to be full", flow.peerWindow)
+				}
+				finEnd, finDropped := dropFinAcknowledgement(traffic, server)
+				err = server.CloseWrite()
+				if err != nil {
+					test.Fatal(err)
+				}
+				time.Sleep(50 * time.Millisecond)
+				if flow := traffic.snapshot(server.key); flow.fin != 0 {
+					test.Fatalf("FIN sent at sequence %d outside the zero receive window; the advertised right edge is %d", flow.fin, permit)
+				}
+				stream := make([]byte, 1+len(payload))
+				expected := make([]byte, len(stream))
+				expected[0] = windowProbe
+				copy(expected[1:], payload)
+				verifyZeroWindowHalfClose(test, client, server, traffic, stream, expected, finEnd, finDropped)
 			})
-			err = client.SetReadBuffer(64 << 10)
-			if err != nil {
-				test.Fatal(err)
-			}
-			data := make([]byte, len(payload))
-			_, err = io.ReadFull(client, data)
-			if err != nil || !bytes.Equal(data, payload) {
-				test.Fatalf("half-close data: %v", err)
-			}
-			traffic.await(test, server, "drop FIN acknowledgement at a closed receive window", func(flow kernelTCPFlow) bool {
-				return slices.ContainsFunc(flow.events, func(event kernelTCPEvent) bool { return event.dropped && finAcknowledgement(event) })
-			})
-			traffic.setFilter(server, nil)
-			client.SetReadDeadline(time.Now().Add(4 * time.Second))
-			_, err = client.Read(data[:1])
-			if err != io.EOF {
-				test.Fatalf("zero-window FIN: %v", err)
-			}
-			traffic.await(test, server, "recover lost FIN acknowledgement", func(flow kernelTCPFlow) bool {
-				return flow.fin != 0 && flow.acked >= flow.fin
-			})
-			err = client.CloseWrite()
-			if err != nil {
-				test.Fatal(err)
-			}
-			_, err = server.Read(data[:1])
-			if err != io.EOF {
-				test.Fatalf("peer FIN: %v", err)
-			}
+		}
+	})
+}
+
+// waitClosedWindow waits until the peer's window stops the sender in the middle of the
+// buffered stream.
+func waitClosedWindow(t *testing.T, conn *GoConn, buffered uint64) (uint64, uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		unacked := conn.sendUnacked.Load()
+		permit := conn.sendPermit.Load() &^ goPermitWindowBit
+		closed := permit == unacked && conn.bufferedTail.Load() == buffered &&
+			unacked > 1 && unacked < buffered && conn.sentTail.Load() == unacked
+		if closed {
+			return unacked, permit
+		}
+		time.Sleep(time.Millisecond)
+	}
+	unacked := conn.sendUnacked.Load()
+	permit := conn.sendPermit.Load() &^ goPermitWindowBit
+	t.Fatalf("receive window did not close: unacked=%d sent=%d buffered=%d permit=%d", unacked, conn.sentTail.Load(), conn.bufferedTail.Load(), permit)
+	return 0, 0
+}
+
+// dropFinAcknowledgement drops the acknowledgement of the FIN so the recovery path that
+// retransmits it is exercised. The FIN starts at the first sequence past the buffered data.
+func dropFinAcknowledgement(traffic *kernelTCPHarness, conn *GoConn) (uint64, func(kernelTCPFlow) bool) {
+	finSequence := conn.bufferedTail.Load()
+	finAck := func(event kernelTCPEvent) bool {
+		return !event.outgoing && event.flags&header.TCPFlagAck != 0 && event.ack == finSequence+1
+	}
+	traffic.setFilter(conn, func(event kernelTCPEvent) kernelTCPAction {
+		if finAck(event) {
+			return kernelTCPAction{drop: true}
+		}
+		return kernelTCPAction{}
+	})
+	return finSequence + 1, func(flow kernelTCPFlow) bool {
+		return slices.ContainsFunc(flow.events, func(event kernelTCPEvent) bool {
+			return event.dropped && finAck(event)
 		})
 	}
 }
 
+func verifyZeroWindowHalfClose(test *testing.T, client *net.TCPConn, server *GoConn, traffic *kernelTCPHarness, stream []byte, expected []byte, finEnd uint64, finDropped func(kernelTCPFlow) bool) {
+	test.Helper()
+	if err := client.SetReadBuffer(64 << 10); err != nil {
+		test.Fatal(err)
+	}
+	client.SetReadDeadline(time.Now().Add(4 * time.Second))
+	_, err := io.ReadFull(client, stream)
+	if err != nil {
+		test.Fatal("zero-window data:", err)
+	}
+	if !bytes.Equal(stream, expected) {
+		test.Fatal("zero-window data corrupted the stream")
+	}
+	traffic.await(test, server, "FIN sent after the receive window reopened", func(flow kernelTCPFlow) bool {
+		return flow.fin == finEnd
+	})
+	traffic.await(test, server, "drop FIN acknowledgement", finDropped)
+	_, err = client.Read(stream[:1])
+	if err != io.EOF {
+		test.Fatalf("zero-window stream end: %v", err)
+	}
+	traffic.setFilter(server, nil)
+	traffic.await(test, server, "recover lost FIN acknowledgement", func(flow kernelTCPFlow) bool {
+		return flow.acked >= flow.fin
+	})
+	err = client.CloseWrite()
+	if err != nil {
+		test.Fatal(err)
+	}
+	server.SetReadDeadline(time.Now().Add(4 * time.Second))
+	_, err = server.Read(stream[:1])
+	if err != io.EOF {
+		test.Fatalf("peer FIN: %v", err)
+	}
+}
 func TestGoKernelWindowLimitedRecovery(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ipv6=%v", ipv6), func(test *testing.T) {

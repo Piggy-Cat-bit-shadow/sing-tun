@@ -964,6 +964,12 @@ func (e *goEngine) maybeSendFin(conn *GoConn) {
 	if conn.sentTail.Load() != buffered || conn.transmittedTail.Load() != buffered {
 		return
 	}
+	// A FIN occupies sequence space, so it may not be sent past the right edge of the
+	// peer's advertised window. The peer reopens the window with an ACK, and input
+	// processing calls this again, so a deferred FIN is not lost.
+	if buffered >= conn.sendUnacked.Load()+conn.peerWindow {
+		return
+	}
 	conn.finOffset = buffered
 	conn.finSent = true
 	segment := goSegment{offset: conn.finOffset, flags: header.TCPFlagFin | header.TCPFlagAck}
