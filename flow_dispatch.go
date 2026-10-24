@@ -876,10 +876,7 @@ func (s *ForwardStage) stagePortBuffer(nat *portNAT, packet []byte) bool {
 	if !ok {
 		return false
 	}
-	headroom := bufferPort.PacketHeadroom()
-	if headroom < 0 {
-		headroom = 0
-	}
+	headroom := max(bufferPort.PacketHeadroom(), 0)
 	buffer := buf.NewSize(headroom + len(packet))
 	if headroom > 0 {
 		buffer.Resize(headroom, 0)

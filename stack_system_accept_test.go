@@ -339,6 +339,7 @@ func (l *levelRecordingLogger) Error(args ...any) { l.errors.Add(1) }
 func (l *levelRecordingLogger) WarnContext(ctx context.Context, args ...any) {
 	l.warnings.Add(1)
 }
+
 func (l *levelRecordingLogger) ErrorContext(ctx context.Context, args ...any) {
 	l.errors.Add(1)
 }

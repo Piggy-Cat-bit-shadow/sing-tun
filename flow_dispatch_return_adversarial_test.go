@@ -116,9 +116,9 @@ func TestReturnPacketsPortMatrix(t *testing.T) {
 			harness := newReturnHarness(t, all...)
 
 			const roundTrips = 4
-			for round := 0; round < roundTrips; round++ {
+			for round := range roundTrips {
 				packets := make([][]byte, ports)
-				for port := 0; port < ports; port++ {
+				for port := range ports {
 					packets[port] = harness.packet(uint16(40000+port), fmt.Sprintf("round%d-port%d", round, port))
 				}
 				if unconsumed := harness.returnPath.ReturnPackets(packets); len(unconsumed) != 0 {
@@ -276,7 +276,7 @@ func TestReturnPacketsConcurrentWithClose(t *testing.T) {
 	var waitGroup sync.WaitGroup
 	var calls atomic.Int64
 	stop := make(chan struct{})
-	for worker := 0; worker < 4; worker++ {
+	for worker := range 4 {
 		packets := make([][]byte, 16)
 		for i := range packets {
 			packets[i] = harness.packet(40000, fmt.Sprintf("close-%d-%d", worker, i))

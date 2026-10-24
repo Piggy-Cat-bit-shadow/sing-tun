@@ -301,5 +301,3 @@ func BenchmarkReturnPackets(b *testing.B) {
 		})
 	}
 }
-
-
