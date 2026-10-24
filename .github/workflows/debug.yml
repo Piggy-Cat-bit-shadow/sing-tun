@@ -1,0 +1,87 @@
+name: debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner image
+        required: true
+        default: ubuntu-latest
+      test:
+        description: Go test -run regexp
+        required: true
+        default: TestGoConnKeepalive
+      count:
+        description: Test count
+        required: true
+        default: '1'
+      firewall:
+        description: Windows only - disable the host firewall before testing
+        required: true
+        type: choice
+        options:
+          - keep
+          - disable
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Environment
+        shell: bash
+        run: |
+          set -x
+          git rev-parse HEAD
+          go version
+          uname -a || true
+          (ip addr || true) 2>&1 | tee /tmp/network.txt
+          (ip route || true) 2>&1 | tee -a /tmp/network.txt
+          (ip -6 route || true) 2>&1 | tee -a /tmp/network.txt
+      - name: Windows firewall state
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-NetFirewallProfile | Format-Table Name,Enabled,DefaultInboundAction,DefaultOutboundAction -AutoSize
+          if ('${{ inputs.firewall }}' -eq 'disable') {
+            Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled False
+            Write-Host 'firewall disabled'
+            Get-NetFirewallProfile | Format-Table Name,Enabled -AutoSize
+          }
+      - name: Test (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          flags=""
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq iproute2
+            flags="-exec sudo"
+          fi
+          go test -v -count=${{ inputs.count }} $flags -timeout=20m -run '${{ inputs.test }}' . 2>&1 | tee /tmp/test.log
+      - name: Test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          go test -v -count=${{ inputs.count }} -timeout=20m -run '${{ inputs.test }}' . 2>&1 | Tee-Object -FilePath test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-log
+          path: |
+            /tmp/test.log
+            /tmp/network.txt
+            test.log
+          if-no-files-found: ignore
