@@ -646,7 +646,7 @@ func kernelBackpressure(t *testing.T, fixture *kernelStackFixture, ipv6 bool, mo
 		t.Fatal(err)
 	}
 	t.Logf("flow %s -> %s", client.LocalAddr(), client.RemoteAddr())
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	client.SetDeadline(deadline)
 	server.SetDeadline(deadline)
 	upload := kernelPayload(size, 113)

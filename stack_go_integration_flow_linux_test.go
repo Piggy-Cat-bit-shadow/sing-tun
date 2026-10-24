@@ -225,7 +225,7 @@ func TestGoKernelZeroWindowHalfClose(t *testing.T) {
 			if err != nil {
 				test.Fatal(err)
 			}
-			deadline := time.Now().Add(3 * time.Second)
+			deadline := time.Now().Add(time.Second)
 			for time.Now().Before(deadline) {
 				if server.sendUnacked.Load() == uint64(len(payload)+1) && server.sendPermit.Load()&^goPermitWindowBit == server.sendUnacked.Load() {
 					break
