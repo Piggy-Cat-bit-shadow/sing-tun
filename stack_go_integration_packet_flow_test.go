@@ -214,6 +214,7 @@ func TestGoKernelPacketMapping(t *testing.T) {
 							}
 							test.Cleanup(func() { client.Close() })
 							client.SetDeadline(time.Now().Add(3 * time.Second))
+							allowKernelPacketPort(test, client.LocalAddr().(*net.UDPAddr).Port)
 							port := uint16(20000 + 8*fixture.port.Add(1))
 							peers := []M.Socksaddr{
 								M.SocksaddrFromNetIP(netip.AddrPortFrom(address.Next(), port)),

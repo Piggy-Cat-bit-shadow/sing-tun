@@ -397,6 +397,7 @@ func verifyZeroWindowHalfClose(test *testing.T, client *net.TCPConn, server *GoC
 		test.Fatalf("peer FIN: %v", err)
 	}
 }
+
 func TestGoKernelWindowLimitedRecovery(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ipv6=%v", ipv6), func(test *testing.T) {
