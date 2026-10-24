@@ -166,31 +166,47 @@ func TestGoConnKeepalive(t *testing.T) {
 	})
 	t.Run("answered", func(scenario *testing.T) {
 		connectionCases(scenario, fixture, func(test *testing.T, conn *GoConn, kernel *net.TCPConn, port uint16) {
-			err := conn.SetKeepAliveConfig(net.KeepAliveConfig{Enable: true, Idle: 100 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 2})
+			// The peer is the real kernel stack. An idle keepalive probe carries
+			// sequence number SND.NXT-1, which is behind RCV.WUP, so Linux treats it
+			// as an out-of-window ACK and rate-limits the duplicate ACK that answers
+			// it (net.ipv4.sysctl_tcp_invalid_ratelimit, HZ/2 = 500ms by default).
+			// Probes spaced closer than that are dropped by the peer's own limiter,
+			// not by this stack. Keep the idle interval above the limiter so every
+			// probe is answerable; Count=2 then makes an unreset probe counter
+			// visible: three answered probes can only happen if each reply restarts
+			// the count.
+			err := conn.SetKeepAliveConfig(net.KeepAliveConfig{Enable: true, Idle: 700 * time.Millisecond, Interval: 700 * time.Millisecond, Count: 2})
 			if err != nil {
 				test.Fatal(err)
 			}
 			recorder := recordWire(test, fixture, port)
-			time.Sleep(2 * time.Second)
 			probes := 0
 			var awaiting []uint32
-			segments := recorder.take()
-			for _, segment := range segments {
-				switch {
-				case segment.probe():
-					probes++
-					awaiting = append(awaiting, segment.sequence+1)
-				case !segment.outbound && segment.payload == 0 && len(awaiting) > 0 && segment.ack >= awaiting[0]:
-					for len(awaiting) > 0 && awaiting[0] <= segment.ack {
-						awaiting = awaiting[1:]
+			reset := false
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline) && !reset; {
+				for _, segment := range recorder.take() {
+					switch {
+					case segment.probe():
+						probes++
+						awaiting = append(awaiting, segment.sequence+1)
+					case segment.outbound && segment.flags&header.TCPFlagRst != 0:
+						reset = true
+					case !segment.outbound && segment.payload == 0 && len(awaiting) > 0 && segment.ack >= awaiting[0]:
+						for len(awaiting) > 0 && awaiting[0] <= segment.ack {
+							awaiting = awaiting[1:]
+						}
 					}
 				}
+				if probes >= 3 && len(awaiting) == 0 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
-			for _, segment := range segments {
-				test.Logf("wire out=%v flags=%#x seq=%d ack=%d payload=%d", segment.outbound, segment.flags, segment.sequence, segment.ack, segment.payload)
+			if reset {
+				test.Fatal("kernel reset the connection although every answered probe was acknowledged")
 			}
-			if probes < 2 || len(awaiting) > 0 {
-				test.Fatalf("kernel left %d of %d probes unacknowledged while idle for 2s", len(awaiting), probes)
+			if probes < 3 || len(awaiting) > 0 {
+				test.Fatalf("kernel left %d of %d probes unacknowledged while idle", len(awaiting), probes)
 			}
 			err = kernelTransfer(conn, kernel, kernelPayload(1<<20, 5), false)
 			if err != nil {
