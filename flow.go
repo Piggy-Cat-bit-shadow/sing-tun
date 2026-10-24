@@ -3,6 +3,8 @@ package tun
 import (
 	"net/netip"
 	"time"
+
+	"github.com/sagernet/sing/common/buf"
 )
 
 type FlowVerdict struct {
@@ -61,6 +63,28 @@ type Port interface {
 	AttachReturn(returnPath Return) error
 	DetachReturn(returnPath Return) error
 	WritePackets(packets [][]byte) error
+}
+
+// PacketBufferPort is the optional capability of a Port that can take ownership of whole packets
+// instead of borrowing their bytes for the duration of WritePackets.
+//
+// The forward dispatcher stages packets between the read loop and Flush. For an ordinary Port it
+// stages borrowed views (or a private copy when the frame carries GSO metadata); for a
+// PacketBufferPort it allocates one headroomed buffer per packet and hands that ownership over.
+// The port therefore copies the packet once, instead of the dispatcher copying it once and the
+// port copying it again.
+//
+// # Ownership
+//
+// WritePacketBuffers takes ownership of EVERY buffer unconditionally: before it returns, for any
+// return value, it must have released or transferred all of them. The dispatcher does not release
+// them afterwards. This matches the transport client the MASQUE endpoint uses, whose
+// WritePacketBuffers already consumes and releases the batch when no session is ready.
+type PacketBufferPort interface {
+	Port
+	// PacketHeadroom is the free space the port needs in front of each packet.
+	PacketHeadroom() int
+	WritePacketBuffers(buffers []*buf.Buffer) error
 }
 
 type SelectorRange struct {

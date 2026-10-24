@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,15 +51,41 @@ type System struct {
 	tcpPort6             uint16
 	tcpNat4              *TCPNat
 	tcpNat6              *TCPNat
-	udpNat               *UDPNat
-	udpNATOptions        UDPNatOptions
-	dispatcher           *ForwardDispatcher
-	dispatchStage        *ForwardStage
-	bindInterface        bool
-	interfaceFinder      control.InterfaceFinder
-	frontHeadroom        int
-	txChecksumOffload    bool
-	multiPendingPackets  bool
+	// listenerAccess serialises access to the TCP listener fields above between Close, the accept
+	// loop's recovery path and the dispatch path that reads the listener port.
+	listenerAccess sync.Mutex
+	// listenConfig is what the accept loop needs to recreate a listener after an unexpected
+	// failure. It is recorded by start() because it is exactly the configuration it bound with.
+	//
+	// It is recorded ONCE, before either family is bound, because the configuration is not
+	// family-specific: the network name and the address are per-family arguments to the bind, and
+	// they are passed to acceptLoop and recoverListener separately. Recording it inside the IPv4
+	// branch - which is what this did - left an IPv6-only stack with no configuration to re-bind
+	// with, so recoverListener returned "no listen configuration recorded" and the accept loop
+	// terminated permanently. The listener's port is what every new SYN is rewritten onto, so the
+	// stack then kept rewriting connections onto a dead port while UDP and QUIC carried on working.
+	//
+	// Only read under listenerAccess, in recoverListener; written here, before any listener exists.
+	listenConfig *net.ListenConfig
+	// closing is set before the listeners are closed, so the accept loop can tell an orderly
+	// shutdown apart from an unexpected failure and never re-creates a listener after Close.
+	closing atomic.Bool
+	// recoveredListeners counts accept-loop recoveries. A non-zero value means something is
+	// still closing the listener from outside this stack; it exists as telemetry, not as state
+	// the loop consumes.
+	recoveredListeners atomic.Uint64
+	// recreateListener replaces the accept loop's listener-bind step. It is nil in production
+	// (the bind is used directly) and only set by tests that need to drive a bind failure.
+	recreateListener    func() (net.Listener, error)
+	udpNat              *UDPNat
+	udpNATOptions       UDPNatOptions
+	dispatcher          *ForwardDispatcher
+	dispatchStage       *ForwardStage
+	bindInterface       bool
+	interfaceFinder     control.InterfaceFinder
+	frontHeadroom       int
+	txChecksumOffload   bool
+	multiPendingPackets bool
 }
 
 type Session struct {
@@ -122,14 +150,44 @@ func (s *System) ResetNetwork() {
 }
 
 func (s *System) Close() error {
+	// The flag goes up before any listener is closed, so an accept loop that wakes up between the
+	// close and its own exit sees "closing" and exits quietly instead of treating the close as a
+	// failure and re-creating the listener. Without it, shutdown races the recovery path and the
+	// stack can come back to life while the tunnel is going down.
+	s.closing.Store(true)
 	s.dispatcher.Close()
 	if s.udpNat != nil {
 		s.udpNat.Close()
 	}
+	s.listenerAccess.Lock()
+	tcpListener := s.tcpListener
+	tcpListener6 := s.tcpListener6
+	s.listenerAccess.Unlock()
 	return common.Close(
-		s.tcpListener,
-		s.tcpListener6,
+		tcpListener,
+		tcpListener6,
 	)
+}
+
+// RecoveredListeners reports how many times the TCP accept loop has re-created its listener after
+// an unexpected failure. Zero is the healthy value; every increment means something outside this
+// stack closed a listener it did not own.
+func (s *System) RecoveredListeners() uint64 {
+	return s.recoveredListeners.Load()
+}
+
+// tcpListenerPort reports the port new TCP flows are currently rewritten onto.
+//
+// The dispatch path reads this while the accept loop's recovery path writes it, so the read is
+// taken under the same lock the write uses. It is one uncontended lock per new TCP flow, not per
+// packet.
+func (s *System) tcpListenerPort(recoveryIPv6 bool) uint16 {
+	s.listenerAccess.Lock()
+	defer s.listenerAccess.Unlock()
+	if recoveryIPv6 {
+		return s.tcpPort6
+	}
+	return s.tcpPort
 }
 
 func (s *System) Start() error {
@@ -155,9 +213,15 @@ func (s *System) start() error {
 	}
 	var tcpListener net.Listener
 	var err error
+	// The bind configuration is family-independent, so it is recorded once for BOTH families rather
+	// than inside the IPv4 branch. An IPv6-only stack otherwise has nothing to re-bind with and
+	// cannot recover its accept loop; see the field comment.
+	s.listenConfig = &listener
 	if s.inet4NextAddress.IsValid() {
+		network := "tcp4"
+		address := net.JoinHostPort(s.inet4Address.String(), "0")
 		for range 3 {
-			tcpListener, err = listenNetworkNamespace(s.ctx, s.netNs, listener, "tcp4", net.JoinHostPort(s.inet4Address.String(), "0"))
+			tcpListener, err = listenNetworkNamespace(s.ctx, s.netNs, listener, network, address)
 			if !retryableListenError(err) {
 				break
 			}
@@ -169,11 +233,13 @@ func (s *System) start() error {
 		s.tcpListener = tcpListener
 		s.tcpPort = M.SocksaddrFromNet(tcpListener.Addr()).Port
 		s.tcpNat4 = NewNat(s.ctx, s.udpTimeout)
-		go s.acceptLoop(tcpListener, s.tcpNat4)
+		go s.acceptLoop(tcpListener, s.tcpNat4, network, address)
 	}
 	if s.inet6NextAddress.IsValid() {
+		network := "tcp6"
+		address := net.JoinHostPort(s.inet6Address.String(), "0")
 		for range 3 {
-			tcpListener, err = listenNetworkNamespace(s.ctx, s.netNs, listener, "tcp6", net.JoinHostPort(s.inet6Address.String(), "0"))
+			tcpListener, err = listenNetworkNamespace(s.ctx, s.netNs, listener, network, address)
 			if !retryableListenError(err) {
 				break
 			}
@@ -185,7 +251,7 @@ func (s *System) start() error {
 		s.tcpListener6 = tcpListener
 		s.tcpPort6 = M.SocksaddrFromNet(tcpListener.Addr()).Port
 		s.tcpNat6 = NewNat(s.ctx, s.udpTimeout)
-		go s.acceptLoop(tcpListener, s.tcpNat6)
+		go s.acceptLoop(tcpListener, s.tcpNat6, network, address)
 	}
 	udpNATOptions := s.udpNATOptions
 	udpNATOptions.Handler = s.handler
@@ -388,11 +454,72 @@ func (s *System) processPacket(packet []byte) bool {
 	return writeBack
 }
 
-func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
+// acceptRecoveryDelays is the backoff between attempts to re-bind a listener after an unexpected
+// accept failure. It is a var so tests can shrink the sequence.
+var acceptRecoveryDelays = []time.Duration{
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	250 * time.Millisecond,
+	time.Second,
+}
+
+// acceptRecoveryDelay returns the wait before re-binding attempt number attempt (zero-based).
+// The last entry is the cap, so a listener that cannot be re-bound retries once a second instead
+// of spinning.
+func acceptRecoveryDelay(attempt int) time.Duration {
+	if attempt >= len(acceptRecoveryDelays) {
+		return acceptRecoveryDelays[len(acceptRecoveryDelays)-1]
+	}
+	return acceptRecoveryDelays[attempt]
+}
+
+// acceptLoop accepts TCP from the tun-side listener until the stack is closed.
+//
+// # Why it does not simply return on an accept error
+//
+// The listener is bound to the stack's own address and its port is what tunLoop rewrites every new
+// SYN onto. If the loop gives up, nothing clears that port: the stack keeps rewriting new
+// connections onto a port nobody is listening on, the OS answers RST, and the RST is translated
+// back to the application. Every new TCP connection then fails instantly until the tunnel is
+// rebuilt, while existing connections, UDP and QUIC carry on working - which is why this presents
+// as "the browser is dead but Telegram is fine" rather than as a stack failure.
+//
+// The listener can be closed from outside this stack (the fd space is shared with the embedding
+// application, and a fast restart is the observed trigger), so the error is not necessarily a
+// signal that the stack is finished. An error that is not an orderly shutdown is therefore
+// treated as recoverable: log it, re-bind the listener, publish the new port and carry on.
+//
+// An unbounded `continue` on the same listener would be a hot spin, and re-accepting on a listener
+// whose error is permanent would never succeed, so recovery re-binds instead of retrying, with a
+// bounded backoff between attempts, and gives up (terminating the loop, which is no worse than the
+// behaviour this replaces) only when the bind keeps failing.
+func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat, network string, address string) {
 	for {
+		if s.closing.Load() {
+			// Close is in progress or finished. Whatever happened to the listener, this loop no
+			// longer owns it and must not re-create it.
+			return
+		}
 		conn, err := listener.Accept()
 		if err != nil {
-			return
+			if s.closing.Load() || errors.Is(err, net.ErrClosed) ||
+				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, s.ctx.Err()) {
+				// The stack closed the listener: this is the loop's exit condition, not a fault.
+				return
+			}
+			recovered, recoveryErr := s.recoverListener(listener, network, address)
+			if recoveryErr != nil {
+				s.logger.Error("system stack: tcp", network, " listener failed and could not be ",
+					"restored on ", address, ": ", recoveryErr)
+				return
+			}
+			s.logger.Warn("system stack: tcp listener ", address, " failed (", err,
+				"), continuing on port ", recovered)
+			listener = recovered
+			continue
 		}
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
 		session := tcpNat.LookupBack(connPort)
@@ -401,6 +528,54 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
 			continue
 		}
 		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
+	}
+}
+
+// recoverListener re-binds the listener after an unexpected accept failure and publishes the new
+// port, returning the listener to accept on next.
+func (s *System) recoverListener(broken net.Listener, network string, address string) (net.Listener, error) {
+	// Close the listener we cannot accept on. A listener that was closed from outside reports
+	// net.ErrClosed here, which is expected and not an error.
+	_ = broken.Close()
+	s.listenerAccess.Lock()
+	create := s.recreateListener
+	listenConfig := s.listenConfig
+	s.listenerAccess.Unlock()
+	if create == nil {
+		create = func() (net.Listener, error) {
+			if listenConfig == nil {
+				return nil, E.New("no listen configuration recorded for ", network, " ", address)
+			}
+			return listenNetworkNamespace(s.ctx, s.netNs, *listenConfig, network, address)
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		if s.closing.Load() {
+			return nil, net.ErrClosed
+		}
+		if ctxErr := s.ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		listener, err := create()
+		if err == nil {
+			s.listenerAccess.Lock()
+			if network == "tcp6" {
+				s.tcpListener6 = listener
+				s.tcpPort6 = M.SocksaddrFromNet(listener.Addr()).Port
+			} else {
+				s.tcpListener = listener
+				s.tcpPort = M.SocksaddrFromNet(listener.Addr()).Port
+			}
+			s.listenerAccess.Unlock()
+			s.recoveredListeners.Add(1)
+			return listener, nil
+		}
+		s.logger.Debug("system stack: re-bind tcp ", address, " attempt ", attempt+1, ": ", err)
+		select {
+		case <-time.After(acceptRecoveryDelay(attempt)):
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
 	}
 }
 
@@ -413,7 +588,7 @@ func (s *System) dispatchIPv4(ipHdr header.IPv4, destination netip.Addr) bool {
 		if ipHdr.SourceAddr() == s.inet4Address &&
 			ipHdr.FragmentOffset() == 0 &&
 			len(ipHdr.Payload()) >= header.TCPMinimumSize &&
-			header.TCP(ipHdr.Payload()).SourcePort() == s.tcpPort {
+			header.TCP(ipHdr.Payload()).SourcePort() == s.tcpListenerPort(false) {
 			return false
 		}
 	case header.ICMPv4ProtocolNumber:
@@ -432,7 +607,7 @@ func (s *System) dispatchIPv6(ipHdr header.IPv6, destination netip.Addr) bool {
 		}
 		if ipHdr.SourceAddr() == s.inet6Address &&
 			len(ipHdr.Payload()) >= header.TCPMinimumSize &&
-			header.TCP(ipHdr.Payload()).SourcePort() == s.tcpPort6 {
+			header.TCP(ipHdr.Payload()).SourcePort() == s.tcpListenerPort(true) {
 			return false
 		}
 	case header.ICMPv6ProtocolNumber:
@@ -513,7 +688,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
-	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpPort {
+	} else if source.Addr() == s.inet4Address && source.Port() == s.tcpListenerPort(false) {
 		session := s.tcpNat4.LookupBack(destination.Port())
 		if session == nil {
 			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
@@ -539,7 +714,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 			}
 			rewriteIPv4TCP(ipHdr, tcpHdr, s.txChecksumOffload,
 				s.inet4NextAddress, natPort, true,
-				s.inet4Address, s.tcpPort, true)
+				s.inet4Address, s.tcpListenerPort(false), true)
 		}
 	}
 	return true, nil
@@ -556,7 +731,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
-	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpPort6 {
+	} else if source.Addr() == s.inet6Address && source.Port() == s.tcpListenerPort(true) {
 		session := s.tcpNat6.LookupBack(destination.Port())
 		if session == nil {
 			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
@@ -582,7 +757,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 			}
 			rewriteIPv6TCP(ipHdr, tcpHdr, s.txChecksumOffload,
 				s.inet6NextAddress, natPort, true,
-				s.inet6Address, s.tcpPort6, true)
+				s.inet6Address, s.tcpListenerPort(true), true)
 		}
 	}
 	return true, nil

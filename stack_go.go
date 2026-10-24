@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -33,10 +34,17 @@ type Go struct {
 	directory              goFlowDirectory
 	congestion             *goCongestionOps
 	queueFactory           func(stack *Go) ([]goPlatformIO, error)
-	access                 sync.Mutex
-	engines                []*goEngine
-	closed                 atomic.Bool
-	validateChecksum       bool
+	// access is the publish lock: Start, Close, ResetNetwork and selectEngine take it. It guards
+	// started and every resource Start publishes, so a reader that holds it sees either nothing or a
+	// complete publish.
+	access sync.Mutex
+	// started records that Start published successfully. Start owns it: it is written only by Start,
+	// only while access is held, and only after the resources are published and the engines are
+	// running. closed is the opposite bit and is owned by Close; when both are set, closed wins.
+	started          bool
+	engines          []*goEngine
+	closed           atomic.Bool
+	validateChecksum bool
 }
 
 func NewGo(options StackOptions) (*Go, error) {
@@ -82,9 +90,53 @@ func NewGo(options StackOptions) (*Go, error) {
 	return stack, nil
 }
 
+// Ownership
+//
+// Two things are owned here, and they have different owners.
+//
+// The started resources - s.udpNats, s.dispatcher, s.engines and the directory map Start sizes - are
+// owned by Start. It is the only writer. It publishes them while holding s.access, and it publishes
+// all of them before it creates any engine goroutine, so every goroutine Start creates observes the
+// complete published state without further synchronisation. The slice is filled in before it is
+// reachable from anywhere else; publishing it half-built would let a concurrent reader dereference a
+// nil engine.
+//
+// The started state is owned by Close. s.closed is its decision bit, and Close sets it while holding
+// s.access, before it reads or tears down anything.
+//
+// Start and Close meet on s.access, and that is what makes Close win. Start checks s.closed in the
+// same critical section in which it would publish, so a Start that loses the race publishes nothing
+// and a Start that was refused cannot leave a resource behind. Close sets s.closed and takes its
+// snapshot of the published resources in one critical section, so that snapshot is either empty
+// (Start never published, and its own check now refuses to) or complete (Start published, and
+// everything it published is torn down by this Close call). There is no window in which Start can
+// publish after Close has decided to stop.
+//
+// Close releases s.access before it waits for the engines to exit. It must: the wait is on the
+// engine goroutines, and holding the publish lock through a shutdown would block ResetNetwork and
+// any later Start behind it. The wait itself is on the state Close already took, so nothing can
+// change under it - a second Close returns early on the CAS, and Start cannot publish again.
+//
+// The deadlock rule for s.access: a holder may only wait on something that does not itself wait on
+// s.access. Start holds it while it builds the queues and launches the engines, and nothing else
+// waits on Start. Close holds it only while it snapshots and posts a close message, and postMessage
+// never takes s.access (a lock-free push, a non-blocking wake, and for an already-exited engine a
+// drain under the per-connection locks); it drops the lock before it waits for an engine to exit. So
+// Close never waits on an engine while holding the lock, Start never waits on Close, and there is no
+// path where each holds what the other needs.
 func (s *Go) Start() error {
 	s.access.Lock()
 	defer s.access.Unlock()
+	if s.closed.Load() {
+		// Close won. Refuse before the queue factory runs, so a refused Start creates nothing that
+		// would then have to be undone, and nothing can come back to life after Close returned.
+		return os.ErrClosed
+	}
+	if s.started {
+		// A duplicate Start. The stack is already up, so this is a no-op rather than a second
+		// publish that would leak the first set of engines.
+		return nil
+	}
 	queues, err := s.queueFactory(s)
 	if err != nil {
 		return err
@@ -151,6 +203,7 @@ func (s *Go) Start() error {
 	for _, engine := range s.engines {
 		go engine.run()
 	}
+	s.started = true
 	return nil
 }
 
@@ -341,21 +394,31 @@ func (s *Go) Close() error {
 		s.access.Unlock()
 		return nil
 	}
-	for _, engine := range s.engines {
+	// Snapshot under the lock Start publishes under, and not before: the CAS above is the decision
+	// that Start can no longer publish, so what is read here is final. Reading the fields again after
+	// the unlock is what raced with a late Start, and reading a half-built engine slice is what
+	// panicked.
+	engines := s.engines
+	udpNats := s.udpNats
+	dispatcher := s.dispatcher
+	for _, engine := range engines {
 		engine.postMessage(&engine.closeMessage)
 	}
 	s.access.Unlock()
-	for _, engine := range s.engines {
+	// From here on work from the snapshot. s.access is released so the wait below cannot block the
+	// publish lock, and the snapshot is what this Close owns: a refused Start never writes these
+	// fields, so there is no state left to observe.
+	for _, engine := range engines {
 		<-engine.exitSignal
 	}
-	if s.dispatcher != nil {
-		s.dispatcher.Close()
+	if dispatcher != nil {
+		dispatcher.Close()
 	}
-	for _, udpNat := range s.udpNats {
+	for _, udpNat := range udpNats {
 		udpNat.Close()
 	}
 	var err error
-	for _, engine := range s.engines {
+	for _, engine := range engines {
 		err = E.Errors(err, engine.platformIO.close())
 	}
 	return err

@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-tun/gtcpip"
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/gtcpip/header"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -163,6 +164,9 @@ type ForwardDispatcher struct {
 type stagedPort struct {
 	nat     *portNAT
 	packets [][]byte
+	// buffers are owned packets for a PacketBufferPort. A port is either a packets port or a
+	// buffers port for the lifetime of the stage, never both.
+	buffers []*buf.Buffer
 }
 
 type ForwardStage struct {
@@ -245,6 +249,16 @@ func (d *ForwardDispatcher) Close() {
 		stage.access.Lock()
 		for key, entry := range stage.table {
 			stage.removeEntry(key, entry, FlowCloseReset)
+		}
+		// A stage closed with owned packets still staged would otherwise leak them: Flush returns
+		// early once the dispatcher is closed. The release is under the same lock Flush takes for
+		// the port loop, so a Flush that already passed the closed check cannot hand a buffer to
+		// the port while it is being released here.
+		for index := range stage.ports {
+			if len(stage.ports[index].buffers) > 0 {
+				buf.ReleaseMulti(stage.ports[index].buffers)
+				stage.ports[index].buffers = nil
+			}
 		}
 		stage.access.Unlock()
 	}
@@ -345,14 +359,15 @@ func (s *ForwardStage) handleHit(entry *flowEntry, packet *forwardPacket, raw []
 		}
 		return true, false
 	case ActionAccept:
-		if packet.protocol == uint8(header.TCPProtocolNumber) {
-			if packet.tcpFlags&header.TCPFlagRst != 0 {
-				return false, true
-			}
-			if packet.tcpFlags&header.TCPFlagSyn == 0 {
-				entry.idle = tcpEstablishedTimeout
-			}
-		} else if packet.protocol == uint8(header.UDPProtocolNumber) {
+		if packet.protocol == uint8(header.TCPProtocolNumber) && packet.tcpFlags&header.TCPFlagSyn == 0 {
+			// The handshake is complete: the stack owns the connection now, so this flow entry
+			// has done its job. Keeping it would retain an accepted TCP connection for the
+			// lifetime of the tunnel. The caller removes it (remove=true) and the packet
+			// continues to the stack. Upstream baaa611, adapted to this dispatcher's two-result
+			// contract.
+			return false, true
+		}
+		if packet.protocol == uint8(header.UDPProtocolNumber) {
 			packet.verdict = entry.verdict
 		}
 		entry.deadline = now + int64(entry.idle)
@@ -649,10 +664,14 @@ func (s *ForwardStage) forwardToPort(flow *forwardFlow, packet *forwardPacket, r
 		flow.tracker.CountForward(len(raw))
 	}
 	rewriteForward(flow, packet)
-	if meta != nil {
-		raw = s.copyForStage(raw)
+	// A PacketBufferPort takes ownership of a headroomed buffer, so the packet is copied exactly
+	// once (into that buffer) instead of into the stage and then again into the port's own buffer.
+	if !s.stagePortBuffer(flow.nat, raw) {
+		if meta != nil {
+			raw = s.copyForStage(raw)
+		}
+		s.stagePort(flow.nat, raw)
 	}
-	s.stagePort(flow.nat, raw)
 }
 
 func (s *ForwardStage) copyForStage(raw []byte) []byte {
@@ -672,6 +691,12 @@ func rewriteForward(flow *forwardFlow, packet *forwardPacket) {
 }
 
 func (s *ForwardStage) stagePort(nat *portNAT, packet []byte) {
+	// Fragmentation and TCP resegmentation call this with a packet that is not the forwarded
+	// frame's bytes. A buffer port must still receive those in order with the rest of the
+	// traffic to that port, so they take the same owned-buffer path.
+	if s.stagePortBuffer(nat, packet) {
+		return
+	}
 	for index := range s.ports {
 		if s.ports[index].nat == nat {
 			s.ports[index].packets = append(s.ports[index].packets, packet)
@@ -679,6 +704,33 @@ func (s *ForwardStage) stagePort(nat *portNAT, packet []byte) {
 		}
 	}
 	s.ports = append(s.ports, stagedPort{nat: nat, packets: [][]byte{packet}})
+}
+
+// stagePortBuffer copies packet into one headroomed buffer and stages it for a PacketBufferPort.
+// It reports whether the port takes owned buffers; when it returns false the caller keeps using
+// the borrowed staging path.
+func (s *ForwardStage) stagePortBuffer(nat *portNAT, packet []byte) bool {
+	bufferPort, ok := nat.port.(PacketBufferPort)
+	if !ok {
+		return false
+	}
+	headroom := bufferPort.PacketHeadroom()
+	if headroom < 0 {
+		headroom = 0
+	}
+	buffer := buf.NewSize(headroom + len(packet))
+	if headroom > 0 {
+		buffer.Resize(headroom, 0)
+	}
+	_, _ = buffer.Write(packet)
+	for index := range s.ports {
+		if s.ports[index].nat == nat {
+			s.ports[index].buffers = append(s.ports[index].buffers, buffer)
+			return true
+		}
+	}
+	s.ports = append(s.ports, stagedPort{nat: nat, buffers: []*buf.Buffer{buffer}})
+	return true
 }
 
 func (s *ForwardStage) stageReject(packet *forwardPacket, raw []byte, meta *ForwardFrameMeta) {
@@ -716,8 +768,25 @@ func (s *ForwardStage) Flush() {
 		}
 		s.access.Unlock()
 	}
+	// The port loop runs under access: Close releases staged owned buffers under the same lock, so
+	// a Flush that observed the dispatcher open cannot race a close-time release.
+	s.access.Lock()
 	for index := range s.ports {
 		staged := &s.ports[index]
+		if len(staged.buffers) > 0 {
+			if bufferPort, ok := staged.nat.port.(PacketBufferPort); ok {
+				// Ownership transfers unconditionally: on any return the port has released or
+				// transferred every buffer, so this code must not touch them again.
+				err := bufferPort.WritePacketBuffers(staged.buffers)
+				if err != nil {
+					d.logger.Trace(E.Cause(err, "forward packets"))
+				}
+			} else {
+				buf.ReleaseMulti(staged.buffers)
+			}
+			clear(staged.buffers)
+			staged.buffers = staged.buffers[:0]
+		}
 		if len(staged.packets) == 0 {
 			continue
 		}
@@ -728,6 +797,7 @@ func (s *ForwardStage) Flush() {
 		clear(staged.packets)
 		staged.packets = staged.packets[:0]
 	}
+	s.access.Unlock()
 	if retain := max(s.segmentUsed, segmentRetainCount); len(s.segmentBuffers) > retain {
 		clear(s.segmentBuffers[retain:])
 		s.segmentBuffers = s.segmentBuffers[:retain]
@@ -869,18 +939,67 @@ type returnBatch struct {
 	packets   [][]byte
 }
 
+// ReturnPackets classifies one batch of packets returning from a port and writes each group back
+// through the writeback that owns it.
+//
+// # Why there is no grouping container on the common path
+//
+// A writeback is the stage that owns the flow, and in production one port serves one stage, so a
+// whole batch carries a single writeback. The previous implementation could not know that before
+// classifying, so it always built a []returnBatch plus one packet slice per batch: two
+// allocations for a single packet, seven for a 64-packet burst. The grouping is only needed when a
+// SECOND writeback appears.
+//
+// So the packets are compacted in place while every packet so far shares one writeback, and the
+// original grouping is built on the first disagreement. That keeps the allocation-free path exact
+// and leaves the multi-writeback path with the same batches, boundaries and order it had before.
+//
+// The compaction reuses the caller's slice, so it may only write at positions already read; that is
+// why the target index is always at most the loop index. A batch with no dropped or passed packet
+// is left completely untouched: every write would land on the element already there, so the branch
+// below skips it. That keeps the input unmodified on the common path, which is the contract the
+// callers had before this change and the one a shared read-only batch can rely on.
 func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 	if r.dispatcher.closed.Load() {
 		return packets
 	}
 	headroom := r.dispatcher.writeback.ReturnHeadroom()
 	now := r.dispatcher.now()
-	unconsumed := packets[:0]
-	var batches []returnBatch
-	for _, raw := range packets {
+	var (
+		// kept counts the packets of the first writeback, compacted towards the front of the
+		// caller's slice.
+		kept           int
+		firstWriteback ForwardWriteback
+		haveWriteback  bool
+		batches        []returnBatch
+		mixed          bool
+		// unconsumed only allocates when a packet is passed back to the caller, which is the
+		// uncommon case; the common path returns a nil slice.
+		unconsumed [][]byte
+	)
+	for index, raw := range packets {
 		decision, writeback := r.classifyReturn(raw, headroom, now)
 		switch decision {
 		case returnWrite:
+			if !mixed {
+				if !haveWriteback {
+					firstWriteback = writeback
+					haveWriteback = true
+				}
+				if writeback == firstWriteback {
+					if index != kept {
+						// Only reached after a drop or a pass left a gap, and the target is
+						// always an element already read.
+						packets[kept] = raw
+					}
+					kept++
+					continue
+				}
+				// A second writeback in one batch: build exactly the grouping the previous
+				// implementation built, seeded with everything already classified.
+				mixed = true
+				batches = append(batches, returnBatch{writeback: firstWriteback, packets: packets[:kept]})
+			}
 			index := slices.IndexFunc(batches, func(batch returnBatch) bool { return batch.writeback == writeback })
 			if index < 0 {
 				batches = append(batches, returnBatch{writeback: writeback})
@@ -891,6 +1010,15 @@ func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
 		default:
 			unconsumed = append(unconsumed, raw)
 		}
+	}
+	if !mixed {
+		if haveWriteback && kept > 0 {
+			err := firstWriteback.WriteReturnPackets(packets[:kept])
+			if err != nil {
+				r.dispatcher.logger.Trace(E.Cause(err, "write return packets"))
+			}
+		}
+		return unconsumed
 	}
 	for _, batch := range batches {
 		err := batch.writeback.WriteReturnPackets(batch.packets)
