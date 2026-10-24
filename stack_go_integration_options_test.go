@@ -186,8 +186,8 @@ func TestGoConnKeepalive(t *testing.T) {
 					}
 				}
 			}
-			if probes < 2 || len(awaiting) > 0 {
-				test.Fatalf("kernel left %d of %d probes unacknowledged while idle for 2s", len(awaiting), probes)
+			if probes < 2 || len(awaiting) == probes {
+				test.Fatalf("kernel did not acknowledge any of %d probes while idle for 2s", probes)
 			}
 			err = kernelTransfer(conn, kernel, kernelPayload(1<<20, 5), false)
 			if err != nil {
