@@ -376,7 +376,7 @@ func (s *Go) ReleaseSelector(protocol uint8, address netip.AddrPort) {
 func (s *Go) ResetNetwork() {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.closed.Load() {
+	if s.closed.Load() || !s.started {
 		return
 	}
 	for _, udpNat := range s.udpNats {
