@@ -163,6 +163,10 @@ type ForwardDispatcher struct {
 	closed          atomic.Bool
 	portsAccess     sync.Mutex
 	ports           map[Port]*portReturn
+	// routedPort is the return path of the one port that serves flows from the local stack. It is
+	// kept apart from ports so ReturnParsed can find it without the ports lock on the engine's path;
+	// every other port's return path stays in ports.
+	routedPort      atomic.Pointer[portReturn]
 	stagesAccess    sync.Mutex
 	stages          []*ForwardStage
 	stageCount      atomic.Int32
@@ -303,6 +307,7 @@ func (d *ForwardDispatcher) Close() {
 	d.portsAccess.Lock()
 	returnPaths := slices.Collect(maps.Values(d.ports))
 	d.portsAccess.Unlock()
+	d.routedPort.Store(nil)
 	for _, returnPath := range returnPaths {
 		returnPath.nat.port.DetachReturn(returnPath)
 		releasePortNAT(returnPath.nat)
@@ -325,6 +330,29 @@ func (s *ForwardStage) DispatchParsed(packet []byte, meta ForwardFrameMeta, pars
 		return false
 	}
 	return s.dispatch(packet, parsed, &meta)
+}
+
+// ReturnParsed offers one packet the local stack is about to send to the routed port's return path.
+// It reports whether the packet belonged to a dispatched flow and was consumed.
+//
+// The packet is copied because classifyReturn rewrites in place and the caller's buffer is reused as
+// soon as this returns. The copy also carries the headroom ReturnPackets slices by, which is the
+// writeback's own return headroom.
+//
+// Nothing is reported for a packet that no routed port is registered for: the stack keeps writing it
+// the way it always has, which is what keeps the feature off by default.
+func (s *ForwardStage) ReturnParsed(packet []byte, _ ForwardFrameMeta, _ *forwardPacket) bool {
+	if s == nil || s.dispatcher == nil {
+		return false
+	}
+	returnPath := s.dispatcher.routedPort.Load()
+	if returnPath == nil {
+		return false
+	}
+	headroom := returnPath.ReturnHeadroom()
+	staged := make([]byte, headroom+len(packet))
+	copy(staged[headroom:], packet)
+	return len(returnPath.ReturnPackets([][]byte{staged})) == 0
 }
 
 func (s *ForwardStage) dispatch(packet []byte, parsed *forwardPacket, meta *ForwardFrameMeta) bool {
@@ -779,6 +807,11 @@ func (d *ForwardDispatcher) natFor(port Port) *portNAT {
 		return nil
 	}
 	d.ports[port] = returnPath
+	if _, isRouted := port.(RoutedPort); isRouted {
+		// Published after the attach and under the same lock that guards ports, so a reader that
+		// observes the routed path also observes a complete portReturn.
+		d.routedPort.Store(returnPath)
+	}
 	return returnPath.nat
 }
 

@@ -65,6 +65,18 @@ type Port interface {
 	WritePackets(packets [][]byte) error
 }
 
+// RoutedPort is a Port that the local stack itself serves: a flow dispatched to it is written back
+// into the stack instead of a physical link, and the stack's own packets are offered to the
+// attached return path before they leave.
+//
+// It is a marker, not a second behaviour surface. The dispatcher only needs to know that a port
+// registered this way may consume the stack's own packets, so that ReturnParsed can offer them to
+// it and let everything else fall through unchanged.
+type RoutedPort interface {
+	Port
+	RoutedPort()
+}
+
 // PacketBufferPort is the optional capability of a Port that can take ownership of whole packets
 // instead of borrowing their bytes for the duration of WritePackets.
 //

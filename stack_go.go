@@ -31,6 +31,12 @@ type Go struct {
 	udpNats                []*UDPNat
 	fragmentIdentification atomic.Uint32
 	dispatcher             *ForwardDispatcher
+	inet4Address           netip.Addr
+	inet6Address           netip.Addr
+	// returnPath is the return path the dispatcher attached when this stack was registered as a
+	// routed port. The dispatcher attaches it once from natFor, so it is nil until a flow is routed
+	// into the stack and nil again after DetachReturn.
+	returnPath atomic.Pointer[Return]
 	directory              goFlowDirectory
 	congestion             *goCongestionOps
 	queueFactory           func(stack *Go) ([]goPlatformIO, error)
@@ -86,6 +92,12 @@ func NewGo(options StackOptions) (*Go, error) {
 		stack.queueFactory = func(current *Go) ([]goPlatformIO, error) {
 			return []goPlatformIO{&goMemoryIO{stack: current, tun: memoryTun, handed: make([]*buf.Buffer, 0, goReadBatch), blocked: make(map[*OutboundQueue]*goBlockedWriters)}}, nil
 		}
+	}
+	if len(options.TunOptions.Inet4Address) > 0 {
+		stack.inet4Address = options.TunOptions.Inet4Address[0].Addr()
+	}
+	if len(options.TunOptions.Inet6Address) > 0 {
+		stack.inet6Address = options.TunOptions.Inet6Address[0].Addr()
 	}
 	return stack, nil
 }
@@ -213,6 +225,49 @@ func goCloseQueues(queues []goPlatformIO) error {
 		err = E.Errors(err, queue.close())
 	}
 	return err
+}
+
+// RoutedPort marks the stack as a Port the dispatcher may deliver flows to. The stack serves them
+// itself: WritePackets feeds the packet back into the engine, the local endpoints answer, and the
+// answers leave through the attached return path.
+func (s *Go) RoutedPort() {}
+
+func (s *Go) PortAddresses() (netip.Addr, netip.Addr) {
+	return s.inet4Address, s.inet6Address
+}
+
+func (s *Go) PortMTU() uint32 {
+	return uint32(s.mtu)
+}
+
+func (s *Go) AttachReturn(returnPath Return) error {
+	if returnPath == nil {
+		return E.New("nil return path")
+	}
+	s.returnPath.Store(&returnPath)
+	return nil
+}
+
+// DetachReturn clears whatever this stack has attached. A routed port carries exactly one return
+// path (the dispatcher's), so there is nothing to match against.
+func (s *Go) DetachReturn(Return) error {
+	s.returnPath.Store(nil)
+	return nil
+}
+
+// WritePackets delivers dispatched flows back into the stack. The packet is not copied: the engines
+// consume the frame before writeDatagram returns, which is the same contract the dispatcher's own
+// writeback relies on.
+func (s *Go) WritePackets(packets [][]byte) error {
+	if len(s.engines) == 0 {
+		return E.New("stack not started")
+	}
+	platformIO := s.engines[0].platformIO
+	var writeErr error
+	for _, packet := range packets {
+		writeErr = E.Errors(writeErr, goIgnoreDropped(platformIO.writeDatagram(packet, ForwardFrameMeta{})))
+	}
+	return writeErr
 }
 
 func (s *Go) HasEndpoint(protocol uint8, local, remote netip.AddrPort) bool {
