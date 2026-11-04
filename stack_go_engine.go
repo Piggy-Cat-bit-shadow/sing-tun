@@ -813,8 +813,53 @@ func (e *goEngine) dropNonUnicast(parsed *forwardPacket) bool {
 	return !destination.IsGlobalUnicast()
 }
 
+// swapLoopbackAddresses exchanges the packet's source and destination addresses in place.
+//
+// It is the whole of the reflection: a packet the device addressed to a loopback address is
+// handed back to the platform with the two ends exchanged, so the local stack sees it as
+// traffic FROM that address. The transport header is left untouched - the platform path that
+// writes it back owns checksum handling, and rewriting a port or a checksum here would make the
+// reflected packet a different conversation than the original.
+func swapLoopbackAddresses(network []byte, ipVersion uint8) {
+	if ipVersion == 4 {
+		if len(network) < header.IPv4MinimumSize {
+			return
+		}
+		ipHdr := header.IPv4(network)
+		source := ipHdr.SourceAddress()
+		ipHdr.SetSourceAddress(ipHdr.DestinationAddress())
+		ipHdr.SetDestinationAddress(source)
+		return
+	}
+	if len(network) < header.IPv6MinimumSize {
+		return
+	}
+	ipHdr := header.IPv6(network)
+	source := ipHdr.SourceAddress()
+	ipHdr.SetSourceAddress(ipHdr.DestinationAddress())
+	ipHdr.SetDestinationAddress(source)
+}
+
+// isLoopbackProtocol reports whether this transport is reflected by the hairpin.
+//
+// TCP was the first case because the sideloaded-build loopback connection is a TCP one. UDP and
+// ICMP are included because the address is a general "this device answers for it" declaration,
+// not a TCP-only one: a QUIC or a ping to the same address must not take a different path than a
+// connect. Anything else (SCTP, GRE, ...) is left to the normal dispatch.
+func isLoopbackProtocol(protocol uint8) bool {
+	switch protocol {
+	case uint8(header.TCPProtocolNumber),
+		uint8(header.UDPProtocolNumber),
+		uint8(header.ICMPv4ProtocolNumber),
+		uint8(header.ICMPv6ProtocolNumber):
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *goEngine) handleLoopbackHairpin(packet []byte, meta ForwardFrameMeta, parsed *forwardPacket) bool {
-	if parsed.protocol != uint8(header.TCPProtocolNumber) {
+	if !isLoopbackProtocol(parsed.protocol) {
 		return false
 	}
 	var loopbackAddresses []netip.Addr
@@ -826,17 +871,7 @@ func (e *goEngine) handleLoopbackHairpin(packet []byte, meta ForwardFrameMeta, p
 	if !slices.Contains(loopbackAddresses, parsed.destination.Addr()) {
 		return false
 	}
-	if parsed.ipVersion == 4 {
-		ipHdr := header.IPv4(parsed.network)
-		source := ipHdr.SourceAddress()
-		ipHdr.SetSourceAddress(ipHdr.DestinationAddress())
-		ipHdr.SetDestinationAddress(source)
-	} else {
-		ipHdr := header.IPv6(parsed.network)
-		source := ipHdr.SourceAddress()
-		ipHdr.SetSourceAddress(ipHdr.DestinationAddress())
-		ipHdr.SetDestinationAddress(source)
-	}
+	swapLoopbackAddresses(parsed.network, parsed.ipVersion)
 	err := e.platformIO.writeData(e.singleFrame(packet), meta, nil, 0)
 	if err == errGoTransmitBlocked {
 		e.droppedHairpinFrames.record(e.stack.logger, "loopback frames")
