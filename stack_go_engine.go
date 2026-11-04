@@ -862,13 +862,7 @@ func (e *goEngine) handleLoopbackHairpin(packet []byte, meta ForwardFrameMeta, p
 	if !isLoopbackProtocol(parsed.protocol) {
 		return false
 	}
-	var loopbackAddresses []netip.Addr
-	if parsed.ipVersion == 4 {
-		loopbackAddresses = e.stack.inet4LoopbackAddress
-	} else {
-		loopbackAddresses = e.stack.inet6LoopbackAddress
-	}
-	if !slices.Contains(loopbackAddresses, parsed.destination.Addr()) {
+	if !isLoopbackDestination(parsed.destination.Addr(), e.stack.inet4LoopbackAddress, e.stack.inet6LoopbackAddress) {
 		return false
 	}
 	swapLoopbackAddresses(parsed.network, parsed.ipVersion)
@@ -1139,4 +1133,23 @@ func (e *goEngine) answerEcho(packet []byte, parsed *forwardPacket) {
 	if err != nil {
 		e.stack.logger.Trace(E.Cause(err, "go: write echo reply"))
 	}
+}
+
+// isLoopbackDestination reports whether the packet is addressed to one of the addresses the
+// device answers for locally.
+//
+// The comparison unmaps and strips the zone first, because the same address has several legal
+// spellings and the configuration keeps one of them: a packet can carry ::ffff:10.7.0.1 while the
+// configuration lists 10.7.0.1, and a link-local IPv6 packet can carry a zone the configuration
+// never has. Comparing the raw form would make the feature depend on which spelling happened to
+// be used, which is exactly the class of bug the core's own merge normalisation exists to avoid.
+//
+// The family split matters: an IPv4 destination is only matched against the IPv4 list, so an
+// address configured for one family can never claim a packet from the other.
+func isLoopbackDestination(destination netip.Addr, inet4, inet6 []netip.Addr) bool {
+	destination = destination.Unmap().WithZone("")
+	if destination.Is4() {
+		return slices.Contains(inet4, destination)
+	}
+	return slices.Contains(inet6, destination)
 }
