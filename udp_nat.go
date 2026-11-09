@@ -859,6 +859,10 @@ func (c *UDPNatConn) waitReadPacket(options N.ReadWaitOptions) (buffer *buf.Buff
 	}
 	select {
 	case packet := <-c.packetChan:
+		// Every dequeuing path settles the queue's byte reservation exactly once. This
+		// fast path used to only recycle the packet wrapper, leaving the charge behind:
+		// the session then dropped the next datagram against a phantom reservation.
+		c.releaseQueuedBytes(int64(packet.Buffer.Len()))
 		buffer = options.Copy(packet.Buffer)
 		destination = packet.Destination
 		N.PutPacketBuffer(packet)
@@ -904,6 +908,7 @@ func (c *UDPNatConn) WaitReadPackets() (buffers []*buf.Buffer, destinations []M.
 	for len(buffers) < batchSize {
 		select {
 		case packet := <-c.packetChan:
+			c.releaseQueuedBytes(int64(packet.Buffer.Len()))
 			buffers = append(buffers, options.Copy(packet.Buffer))
 			destinations = append(destinations, packet.Destination)
 			N.PutPacketBuffer(packet)
