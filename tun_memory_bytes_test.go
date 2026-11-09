@@ -36,7 +36,7 @@ func popInboundFrame(memoryTun *MemoryTun) {
 	memoryTun.inboundAccess.Lock()
 	if !memoryTun.inbound.empty() {
 		frame, _, _ := memoryTun.inbound.pop()
-		memoryTun.releaseQueuedBytes(int64(frame.Cap()))
+		memoryTun.releaseQueuedBytesLocked(int64(frame.Cap()))
 		frame.Release()
 		memoryTun.inboundWritable.Broadcast()
 	}
@@ -180,8 +180,17 @@ func TestMemoryTunQueuedBytesReturnToZeroOnClose(t *testing.T) {
 	if err := memoryTun.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	// The caller-owned queue still holds its datagrams until it is closed itself; the
+	// device total must reflect that (only the default queue and the inbound ring are the
+	// device's to release).
+	if got := memoryTun.QueuedBytes(); got != queue.QueuedBytes() {
+		t.Fatalf("device total %d after Close, want the caller queue's %d", got, queue.QueuedBytes())
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatalf("queue Close: %v", err)
+	}
 	if got := memoryTun.QueuedBytes(); got != 0 {
-		t.Fatalf("queued bytes %d after Close, want 0", got)
+		t.Fatalf("queued bytes %d after the caller queue closed, want 0", got)
 	}
 	if got := memoryTun.MaxQueuedBytes(); got != 1<<20 {
 		t.Fatalf("reported cap %d, want 1048576", got)

@@ -218,8 +218,10 @@ func (t *MemoryTun) Close() error {
 	}
 	t.inboundWritable.Broadcast()
 	t.inboundAccess.Unlock()
+	// The default queue is the device's own: closing it releases its rings. Caller-owned
+	// queues are closed by their owners; until they are, their datagrams still exist and
+	// the device total must keep saying so instead of pretending the memory was returned.
 	t.outbound.Close()
-	t.queuedBytes.Store(0)
 	close(t.closeSignal)
 	return nil
 }
