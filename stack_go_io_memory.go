@@ -87,7 +87,7 @@ func (o *goMemoryIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int
 		// The frame's bytes leave the device queue here, whether the buffer is handed to
 		// the caller or copied out: the reservation made by writePackets is returned so the
 		// device byte budget tracks what is still queued.
-		o.tun.releaseQueuedBytes(int64(buffer.Cap()))
+		o.tun.releaseQueuedBytesLocked(int64(buffer.Cap()))
 		if options.NeedHeadroom() {
 			buffer = options.Copy(buffer)
 			options.PostReturn(buffer)

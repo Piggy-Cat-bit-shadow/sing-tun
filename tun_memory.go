@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,11 @@ type MemoryTunOptions struct {
 // memory those packets represent. 8 MiB is a few thousand MTU-sized packets, far above a
 // normal burst and far below what the packet counts alone permit.
 const DefaultMemoryTunMaxQueuedBytes = 8 << 20
+
+// errFrameExceedsByteBudget is the defined result for a blocking write whose single frame
+// can never fit the device byte budget: parking would never make room, so the writer is
+// told instead.
+var errFrameExceedsByteBudget = errors.New("tun: frame exceeds the device byte budget")
 
 type MemoryTun struct {
 	mtu              atomic.Int32
@@ -160,6 +166,11 @@ func (t *MemoryTun) writePackets(packets [][]byte, wait bool) (int, error) {
 				headroom = int(t.inboundHeadroom.Load())
 				rearSpace = int(t.inboundRearSpace.Load())
 				frameBytes := int64(headroom + len(packet) + rearSpace)
+				if frameBytes > t.maxQueuedBytes {
+					// No release can ever fit this frame: parking would wait forever.
+					t.inboundAccess.Unlock()
+					return accepted, errFrameExceedsByteBudget
+				}
 				if !t.inbound.full() && t.hasQueuedByteRoom(frameBytes) {
 					break
 				}
@@ -202,14 +213,12 @@ func (t *MemoryTun) Close() error {
 	t.inboundAccess.Lock()
 	for !t.inbound.empty() {
 		frame, _, _ := t.inbound.pop()
-		t.releaseQueuedBytes(int64(frame.Cap()))
+		t.releaseQueuedBytesLocked(int64(frame.Cap()))
 		frame.Release()
 	}
 	t.inboundWritable.Broadcast()
 	t.inboundAccess.Unlock()
 	t.outbound.Close()
-	// The device is dead: whatever accounting a caller-owned queue still carries refers
-	// to memory the stack is tearing down, so the device budget ends at zero.
 	t.queuedBytes.Store(0)
 	close(t.closeSignal)
 	return nil
@@ -268,8 +277,21 @@ func (t *MemoryTun) hasQueuedByteRoom(n int64) bool {
 	return t.queuedBytes.Load()+n <= t.maxQueuedBytes
 }
 
-// releaseQueuedBytes returns n to the device-wide budget.
+// releaseQueuedBytes returns n to the device-wide budget and wakes the writers parked on
+// it. The notification is what connects an OUTBOUND queue's release to an INBOUND waiter:
+// both draw from the same device budget, and a waiter that only ever hears about its own
+// ring's space would sleep until Close.
 func (t *MemoryTun) releaseQueuedBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	t.releaseQueuedBytesLocked(n)
+	t.notifyByteWaiters()
+}
+
+// releaseQueuedBytesLocked returns n to the device-wide budget without notifying. Callers
+// that already hold inboundAccess (the read path, the Close drain) broadcast themselves.
+func (t *MemoryTun) releaseQueuedBytesLocked(n int64) {
 	if n <= 0 {
 		return
 	}
@@ -283,6 +305,15 @@ func (t *MemoryTun) releaseQueuedBytes(n int64) {
 			return
 		}
 	}
+}
+
+// notifyByteWaiters wakes writers parked on the device byte budget. The broadcast happens
+// under inboundAccess, the same mutex the waiters check their condition under, so a
+// release cannot land between a waiter's check and its Wait.
+func (t *MemoryTun) notifyByteWaiters() {
+	t.inboundAccess.Lock()
+	t.inboundWritable.Broadcast()
+	t.inboundAccess.Unlock()
 }
 
 // QueuedBytes reports the bytes this device currently has queued (inbound ring plus all
