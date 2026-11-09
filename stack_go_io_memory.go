@@ -80,7 +80,6 @@ func (o *goMemoryIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int
 	o.tun.inboundHeadroom.Store(int32(options.FrontHeadroom))
 	o.tun.inboundRearSpace.Store(int32(options.RearHeadroom))
 	o.tun.inboundAccess.Lock()
-	defer o.tun.inboundAccess.Unlock()
 	count := 0
 	for count < len(frames) && !o.tun.inbound.empty() {
 		buffer, _, _ := o.tun.inbound.pop()
@@ -96,11 +95,20 @@ func (o *goMemoryIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int
 		frames[count] = goFrame{buffer: buffer}
 		count++
 	}
+	remainEmpty := o.tun.inbound.empty()
 	if count > 0 {
 		// Broadcast, not Signal: byte-budget waiters must also see the release.
 		o.tun.inboundWritable.Broadcast()
 	}
-	return count, o.tun.inbound.empty(), nil
+	o.tun.inboundAccess.Unlock()
+	if count > 0 {
+		// The frames just left the device queue, so the shared byte budget has room: a data
+		// writer parked on it in an outbound queue may now proceed. (Called after the
+		// inbound lock is released: the notification takes the queue lock, and the queue
+		// path takes the inbound lock, so the order is always inbound -> queue.)
+		o.tun.notifyOutboundByteWaiters()
+	}
+	return count, remainEmpty, nil
 }
 
 func (o *goMemoryIO) releaseReadBuffers() {

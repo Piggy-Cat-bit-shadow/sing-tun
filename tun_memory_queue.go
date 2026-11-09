@@ -43,7 +43,7 @@ func (t *MemoryTun) NewOutboundQueue(handler func(packets []*buf.Buffer)) *Outbo
 
 func (q *OutboundQueue) WriteBuffers(buffers []*buf.Buffer) {
 	q.access.Lock()
-	if q.closed.Load() {
+	if q.closed.Load() || q.tun.closed.Load() {
 		q.access.Unlock()
 		buf.ReleaseMulti(buffers)
 		return
@@ -160,7 +160,9 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 	}
 	var err error
 	switch {
-	case q.closed.Load():
+	case q.closed.Load() || q.tun.closed.Load():
+		// The device is gone: a caller-owned queue stops admitting NEW datagrams, while
+		// what it already holds stays its own to release (see OutboundQueue.Close).
 		err = errGoFrameDropped
 	case ring.full() && class == goOutboundData:
 		err = errGoTransmitBlocked
@@ -168,7 +170,15 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		err = errGoFrameDropped
 	}
 	if err == nil && fragments == nil && !q.reserveBytesLocked(packet) {
-		err = errGoFrameDropped
+		if class == goOutboundData {
+			// A TCP segment blocked only by the device byte budget is backpressure, not a
+			// drop: the writer must be armed and retried when the queue drains or the
+			// reader frees the budget. UDP keeps the drop policy.
+			q.transmitInterest = true
+			err = errGoTransmitBlocked
+		} else {
+			err = errGoFrameDropped
+		}
 	}
 	if err == nil && fragments != nil {
 		// Reserve the whole frame group before allocating any of it: a partial group
@@ -178,7 +188,12 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 			fragmentsBytes += int64(q.tun.headroom + len(fragment) + q.tun.rearSpace)
 		}
 		if !q.reserveBytesExactLocked(fragmentsBytes) {
-			err = errGoFrameDropped
+			if class == goOutboundData {
+				q.transmitInterest = true
+				err = errGoTransmitBlocked
+			} else {
+				err = errGoFrameDropped
+			}
 		}
 	}
 	if err != nil {

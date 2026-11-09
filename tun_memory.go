@@ -33,6 +33,11 @@ type MemoryTunOptions struct {
 // normal burst and far below what the packet counts alone permit.
 const DefaultMemoryTunMaxQueuedBytes = 8 << 20
 
+// packetWriteHook is a test seam for the room-check/reservation window: tests set it to
+// take a competing reservation between the check and the CAS, which is the interleaving the
+// blocking write must tolerate.
+var packetWriteHook func()
+
 // errFrameExceedsByteBudget is the defined result for a blocking write whose single frame
 // can never fit the device byte budget: parking would never make room, so the writer is
 // told instead.
@@ -150,10 +155,13 @@ func (t *MemoryTun) writePackets(packets [][]byte, wait bool) (int, error) {
 		if len(packet) == 0 || len(packet) > memoryTunMaxPacketSize {
 			continue
 		}
+		var frameBytes int64
 		if wait {
-			// Park while either the packet ring or the device byte budget has no room.
-			// The byte budget is why a producer of large packets cannot fill the ring with
-			// tens of MiB just because the packet count has not been reached.
+			// Park while either the packet ring or the device byte budget has no room,
+			// and RESERVE inside the loop: the room check and the CAS are not atomic with
+			// each other, so another queue can take the room in between. Skipping the
+			// frame there would lose a blocking write silently; the loop simply parks and
+			// retries instead.
 			for {
 				if t.closed.Load() {
 					t.inboundAccess.Unlock()
@@ -165,14 +173,19 @@ func (t *MemoryTun) writePackets(packets [][]byte, wait bool) (int, error) {
 				}
 				headroom = int(t.inboundHeadroom.Load())
 				rearSpace = int(t.inboundRearSpace.Load())
-				frameBytes := int64(headroom + len(packet) + rearSpace)
+				frameBytes = int64(headroom + len(packet) + rearSpace)
 				if frameBytes > t.maxQueuedBytes {
 					// No release can ever fit this frame: parking would wait forever.
 					t.inboundAccess.Unlock()
 					return accepted, errFrameExceedsByteBudget
 				}
 				if !t.inbound.full() && t.hasQueuedByteRoom(frameBytes) {
-					break
+					if packetWriteHook != nil {
+						packetWriteHook()
+					}
+					if t.reserveQueuedBytes(frameBytes) {
+						break
+					}
 				}
 				if notify {
 					notify = false
@@ -180,15 +193,19 @@ func (t *MemoryTun) writePackets(packets [][]byte, wait bool) (int, error) {
 				}
 				t.inboundWritable.Wait()
 			}
-		}
-		if t.inbound.full() {
-			continue
-		}
-		headroom = int(t.inboundHeadroom.Load())
-		rearSpace = int(t.inboundRearSpace.Load())
-		frameBytes := int64(headroom + len(packet) + rearSpace)
-		if !t.reserveQueuedBytes(frameBytes) {
-			continue
+		} else {
+			if t.inbound.full() {
+				continue
+			}
+			headroom = int(t.inboundHeadroom.Load())
+			rearSpace = int(t.inboundRearSpace.Load())
+			frameBytes = int64(headroom + len(packet) + rearSpace)
+			if packetWriteHook != nil {
+				packetWriteHook()
+			}
+			if !t.reserveQueuedBytes(frameBytes) {
+				continue
+			}
 		}
 		if t.inbound.empty() {
 			notify = true
@@ -306,6 +323,25 @@ func (t *MemoryTun) releaseQueuedBytesLocked(n int64) {
 		if t.queuedBytes.CompareAndSwap(current, next) {
 			return
 		}
+	}
+}
+
+// notifyOutboundByteWaiters hands a byte-blocked outbound queue to the engine. Only the
+// device's own queue is tracked here; a caller-owned queue is woken by its own drain.
+// Callers must not hold the inbound lock or the queue lock (see readBurst).
+func (t *MemoryTun) notifyOutboundByteWaiters() {
+	queue := t.outbound
+	if queue == nil {
+		return
+	}
+	queue.access.Lock()
+	armed := queue.transmitInterest && !queue.closed.Load() && !queue.data.full() && t.hasQueuedByteRoom(1)
+	if armed {
+		queue.transmitInterest = false
+	}
+	queue.access.Unlock()
+	if armed {
+		t.queueWritable(queue)
 	}
 }
 
