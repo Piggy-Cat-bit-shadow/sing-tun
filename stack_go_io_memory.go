@@ -84,6 +84,10 @@ func (o *goMemoryIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int
 	count := 0
 	for count < len(frames) && !o.tun.inbound.empty() {
 		buffer, _, _ := o.tun.inbound.pop()
+		// The frame's bytes leave the device queue here, whether the buffer is handed to
+		// the caller or copied out: the reservation made by writePackets is returned so the
+		// device byte budget tracks what is still queued.
+		o.tun.releaseQueuedBytes(int64(buffer.Cap()))
 		if options.NeedHeadroom() {
 			buffer = options.Copy(buffer)
 			options.PostReturn(buffer)
@@ -92,8 +96,9 @@ func (o *goMemoryIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int
 		frames[count] = goFrame{buffer: buffer}
 		count++
 	}
-	for range count {
-		o.tun.inboundWritable.Signal()
+	if count > 0 {
+		// Broadcast, not Signal: byte-budget waiters must also see the release.
+		o.tun.inboundWritable.Broadcast()
 	}
 	return count, o.tun.inbound.empty(), nil
 }
