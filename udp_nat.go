@@ -52,8 +52,28 @@ type UDPNatOptions struct {
 	Filtering NATFiltering
 	MaxSize   uint32
 
+	// MaxBytesPerSession caps the payload bytes queued for ONE session. The existing
+	// per-session queue cap is a packet COUNT (64), which at the 64 KiB maximum datagram
+	// is 4 MiB of memory per session - the byte cap is the real bound. Zero selects
+	// DefaultUDPNatMaxBytesPerSession.
+	MaxBytesPerSession int
+	// MaxBytes caps the payload bytes queued across ALL sessions of this NAT. A session
+	// count alone (MaxSize) times a per-session byte cap would allow a phone-sized
+	// aggregate. Zero selects DefaultUDPNatMaxBytes.
+	MaxBytes int
+
 	InterfaceFinder control.InterfaceFinder
 }
+
+// UDP NAT queue policy. These are policy values, not protocol constants: they trade a
+// burst of queued datagrams (a slow consumer, a handler that has not started reading)
+// against the memory a phone may hold for the NAT. The per-session value is 16 maximal
+// IPv4 datagrams or ~170 typical 1.5 KiB ones; the shared value fits a few hundred
+// sessions with a packet or two queued each.
+const (
+	DefaultUDPNatMaxBytesPerSession = 256 << 10
+	DefaultUDPNatMaxBytes           = 8 << 20
+)
 
 type udpNatSessionKey struct {
 	sourceAddr      netip.Addr
@@ -100,11 +120,17 @@ type UDPNat struct {
 	classAccess         sync.Mutex
 	classConns          map[uint32]map[*UDPNatConn]struct{}
 	cleanup             *udpNatCleanupQueue
-	state               atomic.Uint32
-	lifecycleAccess     sync.Mutex
-	closeOnce           sync.Once
-	cleanupDone         chan struct{}
-	cleanupWait         sync.WaitGroup
+	// maxQueuedBytes is the per-NAT shared cap; queuedBytes is what the sessions hold.
+	// The reservation is a CAS loop so the cap is a hard bound without a lock on the
+	// packet path.
+	maxQueuedBytes     int64
+	maxBytesPerSession int
+	queuedBytes        atomic.Int64
+	state              atomic.Uint32
+	lifecycleAccess    sync.Mutex
+	closeOnce          sync.Once
+	cleanupDone        chan struct{}
+	cleanupWait        sync.WaitGroup
 }
 
 func NewUDPNat(options UDPNatOptions) *UDPNat {
@@ -137,6 +163,15 @@ func NewUDPNat(options UDPNatOptions) *UDPNat {
 		interfaceFinder: options.InterfaceFinder,
 		classConns:      make(map[uint32]map[*UDPNatConn]struct{}),
 		cleanupDone:     make(chan struct{}),
+	}
+	maxQueuedBytes := options.MaxBytes
+	if maxQueuedBytes <= 0 {
+		maxQueuedBytes = DefaultUDPNatMaxBytes
+	}
+	service.maxQueuedBytes = int64(maxQueuedBytes)
+	service.maxBytesPerSession = options.MaxBytesPerSession
+	if service.maxBytesPerSession <= 0 {
+		service.maxBytesPerSession = DefaultUDPNatMaxBytesPerSession
 	}
 	service.cleanup = newUDPNatCleanupQueue(service)
 	cache.SetLifetime(options.Timeout)
@@ -359,14 +394,15 @@ func (s *UDPNat) getOrCreate(key udpNatSessionKey, source M.Socksaddr, destinati
 			return nil, false
 		}
 		newConn := &UDPNatConn{
-			service:       s,
-			key:           key,
-			writer:        writer,
-			localAddr:     source,
-			packetChan:    make(chan *N.PacketBuffer, 64),
-			doneChan:      make(chan struct{}),
-			readDeadline:  pipe.MakeDeadline(),
-			writeDeadline: pipe.MakeDeadline(),
+			service:        s,
+			key:            key,
+			writer:         writer,
+			localAddr:      source,
+			packetChan:     make(chan *N.PacketBuffer, 64),
+			maxQueuedBytes: int64(s.maxBytesPerSession),
+			doneChan:       make(chan struct{}),
+			readDeadline:   pipe.MakeDeadline(),
+			writeDeadline:  pipe.MakeDeadline(),
 		}
 		newConn.cleanupEntry = &udpNatCleanupEntry{
 			conn:  newConn,
@@ -432,15 +468,127 @@ func UDPNatDroppedPackets() uint64 {
 	return udpNatDroppedPackets.Load()
 }
 
+// udpNatDroppedBytes is the payload-byte companion of udpNatDroppedPackets: the queue
+// caps are byte budgets, so "how much was shed" is a byte question. Together with
+// UDPNat.QueuedBytes and the handler's reads it gives the conservation identity
+//
+//	accepted == delivered + droppedBytes + queuedBytes
+//
+// which is what makes a drop attributable instead of merely visible.
+var udpNatDroppedBytes atomic.Uint64
+
+// UDPNatDroppedBytes reports the payload bytes discarded by the UDP NAT queues since
+// process start (queue full, session closed, teardown).
+func UDPNatDroppedBytes() uint64 {
+	return udpNatDroppedBytes.Load()
+}
+
+// reserveCounter adds n to counter if the result stays within limit. The CAS loop makes
+// the cap a hard bound without a lock on the packet path; a failed reservation adds
+// nothing.
+func reserveCounter(counter *atomic.Int64, limit, n int64) bool {
+	for {
+		current := counter.Load()
+		if current+n > limit {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+n) {
+			return true
+		}
+	}
+}
+
+// releaseCounter returns n to counter, never below zero (a release without a matching
+// reservation is a bookkeeping defect, not a reason to go negative).
+func releaseCounter(counter *atomic.Int64, n int64) {
+	for {
+		current := counter.Load()
+		next := current - n
+		if next < 0 {
+			next = 0
+		}
+		if counter.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+// tryQueueBytes reserves payload bytes against the session cap and then the NAT-wide
+// shared cap. The session reservation is returned if the shared one refuses, so a
+// refused datagram leaves no charge behind.
+func (c *UDPNatConn) tryQueueBytes(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	sessionLimited := c.maxQueuedBytes > 0
+	if sessionLimited && !reserveCounter(&c.queuedBytes, c.maxQueuedBytes, n) {
+		return false
+	}
+	if c.service != nil && c.service.maxQueuedBytes > 0 {
+		if !reserveCounter(&c.service.queuedBytes, c.service.maxQueuedBytes, n) {
+			if sessionLimited {
+				releaseCounter(&c.queuedBytes, n)
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// releaseQueuedBytes returns payload bytes to both counters after a datagram leaves the
+// queue (read or discarded).
+func (c *UDPNatConn) releaseQueuedBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	if c.maxQueuedBytes > 0 {
+		releaseCounter(&c.queuedBytes, n)
+	}
+	if c.service != nil && c.service.maxQueuedBytes > 0 {
+		releaseCounter(&c.service.queuedBytes, n)
+	}
+}
+
+// QueuedBytes reports the payload bytes this session currently has queued.
+func (c *UDPNatConn) QueuedBytes() int {
+	return int(c.queuedBytes.Load())
+}
+
+// MaxQueuedBytes reports this session's byte cap.
+func (c *UDPNatConn) MaxQueuedBytes() int {
+	return int(c.maxQueuedBytes)
+}
+
+// QueuedBytes reports the payload bytes ALL sessions of this NAT currently have queued.
+func (s *UDPNat) QueuedBytes() int {
+	return int(s.queuedBytes.Load())
+}
+
+// MaxQueuedBytes reports the NAT-wide shared byte cap.
+func (s *UDPNat) MaxQueuedBytes() int {
+	return int(s.maxQueuedBytes)
+}
+
 func (c *UDPNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	c.packetAccess.RLock()
 	select {
 	case <-c.doneChan:
 		udpNatDroppedPackets.Add(1)
+		udpNatDroppedBytes.Add(uint64(buffer.Len()))
 		buffer.Release()
 		c.packetAccess.RUnlock()
 		return
 	default:
+	}
+	length := int64(buffer.Len())
+	// Both byte caps are reserved BEFORE the packet exists, so a refused datagram never
+	// allocates a packet buffer and the queue cannot exceed the budgets through a race.
+	if !c.tryQueueBytes(length) {
+		udpNatDroppedPackets.Add(1)
+		udpNatDroppedBytes.Add(uint64(length))
+		buffer.Release()
+		c.packetAccess.RUnlock()
+		return
 	}
 	packet := N.NewPacketBuffer()
 	*packet = N.PacketBuffer{
@@ -451,6 +599,8 @@ func (c *UDPNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	case c.packetChan <- packet:
 	default:
 		udpNatDroppedPackets.Add(1)
+		udpNatDroppedBytes.Add(uint64(length))
+		c.releaseQueuedBytes(length)
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
 	}
@@ -498,12 +648,17 @@ var (
 )
 
 type UDPNatConn struct {
-	service         *UDPNat
-	key             udpNatSessionKey
-	interfaceIndex  uint32
-	writer          N.PacketWriter
-	localAddr       M.Socksaddr
-	packetChan      chan *N.PacketBuffer
+	service        *UDPNat
+	key            udpNatSessionKey
+	interfaceIndex uint32
+	writer         N.PacketWriter
+	localAddr      M.Socksaddr
+	packetChan     chan *N.PacketBuffer
+	// queuedBytes is the payload this session has queued, bounded by maxQueuedBytes.
+	// It is a CAS counter rather than a field under packetAccess because the read path
+	// (ReadPacket) and the close drain do not hold that lock through the channel hand-off.
+	queuedBytes     atomic.Int64
+	maxQueuedBytes  int64
 	packetAccess    sync.RWMutex
 	closeOnce       sync.Once
 	doneChan        chan struct{}
@@ -622,6 +777,7 @@ func (c *UDPNatConn) ReadPacket(buffer *buf.Buffer) (addr M.Socksaddr, err error
 			_, err = buffer.Write(p.Buffer.Bytes())
 		}
 		destination := p.Destination
+		c.releaseQueuedBytes(int64(p.Buffer.Len()))
 		p.Buffer.Release()
 		N.PutPacketBuffer(p)
 		return destination, err
@@ -800,11 +956,15 @@ func (c *UDPNatConn) close() {
 			case packet := <-c.packetChan:
 				// A datagram this session accepted but will never deliver: it was
 				// received from the TUN and is discarded by the close, so it belongs in
-				// the drop counter exactly like a queue-full drop. Without this the
+				// the drop counters exactly like a queue-full drop. Without this the
 				// diagnostics' "received = delivered + dropped" identity has a silent
 				// remainder whenever a session is torn down with packets still queued,
-				// which is the shape a burst with eviction produces.
+				// which is the shape a burst with eviction produces. The byte budget is
+				// returned here too: a closed session must not keep charging the
+				// NAT-wide reservation.
 				udpNatDroppedPackets.Add(1)
+				udpNatDroppedBytes.Add(uint64(packet.Buffer.Len()))
+				c.releaseQueuedBytes(int64(packet.Buffer.Len()))
 				packet.Buffer.Release()
 				N.PutPacketBuffer(packet)
 			default:
