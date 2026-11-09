@@ -219,7 +219,9 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 		}
 	}
 	queue.access.Lock()
-	armed := !queue.closed.Load() && queue.data.full()
+	// The packet ring OR the device byte budget can be what blocks a data write; both arm
+	// the writer, and both are retried when the queue drains or the budget is released.
+	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest)
 	if armed {
 		queue.transmitInterest = true
 	}
@@ -260,7 +262,15 @@ func (o *goMemoryIO) close() error {
 	o.releaseReadBuffers()
 	o.tun.attached.Store(false)
 	o.tun.inboundAccess.Lock()
-	o.tun.inbound.releaseAll()
+	// The detach empties the inbound ring: every frame still queued has to return its
+	// device byte reservation, exactly like the normal read and the device Close do.
+	// releaseAll alone popped the frames and released only the buffers, so the quota
+	// outlived the stack: the next attach was refused and the device Close kept a residue.
+	for !o.tun.inbound.empty() {
+		frame, _, _ := o.tun.inbound.pop()
+		o.tun.releaseQueuedBytesLocked(int64(frame.Cap()))
+		frame.Release()
+	}
 	o.tun.inboundWritable.Broadcast()
 	o.tun.inboundAccess.Unlock()
 	if o.timer != nil {
