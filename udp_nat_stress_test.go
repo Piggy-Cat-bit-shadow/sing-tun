@@ -29,13 +29,30 @@ import (
 // returns a writer that discards; the handler stands in for "route this packet connection", so the
 // test owns the read loop and can count it. This is the smallest fake that exercises the lifecycle
 // the device runs.
+//
+// # Why the counts need barriers
+//
+// The handler runs on a goroutine the NAT starts from the cache-add path, and the drop counter is
+// updated by the enqueue/close paths. A test that reads those counters the instant the last packet
+// was written is therefore observing a MOMENT, not the settled state: the audit's unstable result
+// (`Prepare` = 2000 while the handler had counted 1999) is exactly that race, not a lost flow. The
+// burst test below separates the four properties explicitly:
+//
+//   - a creation barrier (wait for the handler to see every flow) before asserting anything about
+//     handler counts;
+//   - the session table itself (`nat.cache.Len()`) for the capacity bound, sampled during the burst,
+//     because live handler goroutines are an eventually-consistent view and may exceed the bound
+//     transiently while evicted sessions are still unwinding;
+//   - every started handler ending (created == closed, live == 0) as the exit witness;
+//   - packet accounting: each flow sends exactly one datagram, and the handler's reads plus the
+//     NAT's drop counter must add up to the flows, so a silently stranded datagram fails the test.
 
 type natStressHandler struct {
 	access      sync.Mutex
 	connections int
 	live        atomic.Int64
 	closed      atomic.Int64
-	started     sync.WaitGroup
+	packets     atomic.Int64
 }
 
 func (h *natStressHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -61,6 +78,7 @@ func (h *natStressHandler) NewPacketConnectionEx(ctx context.Context, conn N.Pac
 			if err != nil {
 				return
 			}
+			h.packets.Add(1)
 			buffer.Reset()
 		}
 	}()
@@ -123,7 +141,12 @@ func newStressNAT(t *testing.T, maxSize uint32, handler N.UDPConnectionHandlerEx
 // apart from the package's other waitFor because this file must not shadow it.
 func waitForStress(t *testing.T, condition func() bool, what string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitForStressWithin(t, 5*time.Second, condition, what)
+}
+
+func waitForStressWithin(t *testing.T, budget time.Duration, condition func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
 	for !condition() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -148,30 +171,46 @@ func TestUDPNatBurstKeepsTheSessionTableBounded(t *testing.T) {
 	)
 	handler := &natStressHandler{}
 	nat, upstream, prepared := newStressNAT(t, maxSize, handler)
+	droppedBefore := UDPNatDroppedPackets()
 
-	var peak atomic.Int64
+	// Capacity is a property of the TABLE, so it is sampled from the table: handler goroutines are
+	// started and ended asynchronously and can transiently outnumber the bound while evicted
+	// sessions unwind, which is why the audit saw 259 of a 256 bound.
+	var peakTable int
+	var peakHandlers int64
 	for flow := 0; flow < flows; flow++ {
 		packetTo(nat, uint16(10000+flow), "203.0.113.1:443")
-		if live := handler.live.Load(); live > peak.Load() {
-			peak.Store(live)
+		if table := nat.cache.Len(); table > peakTable {
+			peakTable = table
+		}
+		if live := handler.live.Load(); live > peakHandlers {
+			peakHandlers = live
+		}
+		if table := nat.cache.Len(); table > maxSize {
+			t.Fatalf("the session table held %d sessions at flow %d, above its %d bound", table, flow, maxSize)
 		}
 	}
-	// `live` counts handler goroutines, which are started and ended asynchronously, so it is an
-	// eventually-consistent view of the table rather than the table itself. The bound is asserted
-	// after the burst settles; the transient overshoot is a scheduling artifact and is reported
-	// instead of failed, because the property that matters is that the table is bounded and the
-	// evicted sessions are closed.
-	settleDeadline := time.Now().Add(5 * time.Second)
-	for handler.live.Load() > maxSize && time.Now().Before(settleDeadline) {
-		time.Sleep(time.Millisecond)
-	}
-	t.Logf("peak concurrent handler goroutines: %d (bound %d)", peak.Load(), maxSize)
+	t.Logf("peak session table: %d (bound %d); peak handler goroutines: %d (asynchronous view)",
+		peakTable, maxSize, peakHandlers)
 
 	if got := int(prepared.Load()); got != flows {
 		t.Fatalf("prepare was called %d times for %d flows", got, flows)
 	}
-	if got := handler.created(); got != flows {
-		t.Fatalf("the handler saw %d connections for %d flows", got, flows)
+	// Creation barrier: the NAT starts the handler on its own goroutine, so the count is only
+	// meaningful once every flow has been seen. Waiting here is what distinguishes "the handler
+	// had not been called yet" from "a flow never reached the handler".
+	waitForStress(t, func() bool { return handler.created() == flows },
+		"every flow to reach the handler")
+	// The bound is about sessions, not about goroutines: wait for the evicted sessions' handlers to
+	// observe their closed connections before asserting the live count.
+	waitForStress(t, func() bool { return handler.live.Load() <= maxSize },
+		"evicted sessions' handlers to unwind")
+
+	// Every handler that started is either still reading (a live session) or has ended (an evicted
+	// one). Before Close, the live ones cannot have ended, so the exit witness below is taken after
+	// the NAT close; here the invariant is that no handler is missing from that accounting.
+	if created, closed, live := handler.created(), int(handler.closed.Load()), int(handler.live.Load()); created != closed+live {
+		t.Fatalf("%d handlers started but %d ended and %d are live: a handler is missing", created, closed, live)
 	}
 	// Over the bound, eviction must close sessions, not merely forget them.
 	if evicted := handler.closed.Load(); evicted == 0 {
@@ -184,6 +223,19 @@ func TestUDPNatBurstKeepsTheSessionTableBounded(t *testing.T) {
 		t.Fatal("the evicted sessions never closed their upstream")
 	}
 
+	// Packet accounting: one datagram per flow arrived from the "TUN". Each one is either read by
+	// its handler or counted as dropped by the NAT (queue full or teardown). A datagram that is
+	// neither is a silent strand, which the close path used to leave uncounted.
+	waitForStress(t, func() bool {
+		return int(handler.packets.Load())+int(UDPNatDroppedPackets()-droppedBefore) >= flows
+	}, "every datagram to be delivered or counted as dropped")
+	delivered := int(handler.packets.Load())
+	dropped := int(UDPNatDroppedPackets() - droppedBefore)
+	if delivered+dropped != flows {
+		t.Fatalf("packet accounting: %d delivered + %d dropped != %d flows", delivered, dropped, flows)
+	}
+	t.Logf("datagrams: %d delivered, %d dropped (of %d)", delivered, dropped, flows)
+
 	// Closing the NAT must end every flow it still holds: no goroutine, no session, no upstream
 	// left behind. The wait is bounded because a leak would otherwise hang the suite instead of
 	// failing it.
@@ -191,9 +243,9 @@ func TestUDPNatBurstKeepsTheSessionTableBounded(t *testing.T) {
 	if err := nat.Close(); err != nil {
 		t.Fatalf("close the NAT: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for handler.live.Load() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	waitForStress(t, func() bool { return handler.live.Load() == 0 }, "every handler to exit")
+	if created, closed := handler.created(), int(handler.closed.Load()); created != closed {
+		t.Fatalf("%d handlers started but only %d ended after Close", created, closed)
 	}
 	if live := handler.live.Load(); live != 0 {
 		t.Fatalf("%d packet connections outlived the NAT that created them", live)
@@ -219,14 +271,12 @@ func TestUDPNatTwoHundredFlowsLeaveNothingBehind(t *testing.T) {
 
 	nat.Purge()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for handler.live.Load() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitForStress(t, func() bool { return handler.live.Load() == 0 }, "every flow to close")
+	waitForStress(t, func() bool { return int(handler.closed.Load()) == flows }, "every closed flow to be counted")
 	if live := handler.live.Load(); live != 0 {
 		t.Fatalf("%d of %d flows survived Purge", live, flows)
 	}
-	if closed := handler.closed.Load(); closed != flows {
+	if closed := int(handler.closed.Load()); closed != flows {
 		t.Fatalf("%d sessions reported closed, want %d", closed, flows)
 	}
 }
@@ -261,10 +311,7 @@ func TestUDPNatLifetimeReclaimsIdleFlows(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 	nat.PurgeExpired()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for handler.live.Load() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitForStress(t, func() bool { return handler.live.Load() == 0 }, "every idle flow to expire")
 	if live := handler.live.Load(); live != 0 {
 		t.Fatalf("%d idle flows survived their lifetime", live)
 	}

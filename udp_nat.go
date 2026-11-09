@@ -798,6 +798,13 @@ func (c *UDPNatConn) close() {
 		for !drained {
 			select {
 			case packet := <-c.packetChan:
+				// A datagram this session accepted but will never deliver: it was
+				// received from the TUN and is discarded by the close, so it belongs in
+				// the drop counter exactly like a queue-full drop. Without this the
+				// diagnostics' "received = delivered + dropped" identity has a silent
+				// remainder whenever a session is torn down with packets still queued,
+				// which is the shape a burst with eviction produces.
+				udpNatDroppedPackets.Add(1)
 				packet.Buffer.Release()
 				N.PutPacketBuffer(packet)
 			default:
