@@ -200,3 +200,95 @@ func TestCancelClearsTheRecordedWait(t *testing.T) {
 		t.Fatalf("a cancelled writer left its record behind: minWaitNeed = %d", got)
 	}
 }
+
+// TestQueueCloseClearsEveryWaiter is the audit-de6d regression: closing a queue must clear
+// EVERY connection's record, not just the list head, and each of those connections must be
+// able to register a fresh record on another queue afterwards.
+func TestQueueCloseClearsEveryWaiter(t *testing.T) {
+	device := newCrossQueueDevice(t, 4000)
+	holder := parkedQueue(t, device)
+	queueA := parkedQueue(t, device)
+	queueB := parkedQueue(t, device)
+	if err := holder.enqueue(buf.NewSize(4000), nil, goOutboundDatagram, nil, 0); err != nil {
+		t.Fatalf("hold enqueue: %v", err)
+	}
+	waitForBytes(t, "the budget held", func() bool { return device.QueuedBytes() == 4000 })
+	conns := []*GoConn{{}, {}, {}}
+	for index, conn := range conns {
+		conn.outboundQueue.Store(queueA)
+		if err := queueA.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
+			t.Fatalf("conn %d enqueue = %v, want errGoTransmitBlocked", index, err)
+		}
+	}
+	if got := queueA.minWaitNeed(); got != 1000 {
+		t.Fatalf("queue A minWaitNeed = %d, want 1000", got)
+	}
+	if err := queueA.Close(); err != nil {
+		t.Fatalf("queue A Close: %v", err)
+	}
+	for index, conn := range conns {
+		queueA.waitAccess.Lock()
+		owned := conn.waitQueue
+		need := conn.pendingNeed
+		queueA.waitAccess.Unlock()
+		if owned != nil || need != 0 {
+			t.Fatalf("conn %d still owns a record after the close: queue=%p need=%d", index, owned, need)
+		}
+	}
+	// Every cancelled connection can register on another queue.
+	for index, conn := range conns {
+		conn.outboundQueue.Store(queueB)
+		if err := queueB.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
+			t.Fatalf("conn %d re-register = %v, want errGoTransmitBlocked", index, err)
+		}
+	}
+	queueB.waitAccess.Lock()
+	linked := 0
+	for conn := queueB.waitHead; conn != nil; conn = conn.waitNext {
+		linked++
+	}
+	queueB.waitAccess.Unlock()
+	if linked != len(conns) {
+		t.Fatalf("queue B holds %d of %d waiters: the close left stale ownership", linked, len(conns))
+	}
+	if got := queueB.minWaitNeed(); got != 1000 {
+		t.Fatalf("queue B minWaitNeed = %d, want 1000", got)
+	}
+}
+
+// TestWaitRegistrationRacesQueueCloseSafely is the concurrency half of the audit-de6d
+// finding: registration/drop on one goroutine and the queue close on another must stay
+// under waitAccess, leave consistent per-connection ownership and never panic.
+func TestWaitRegistrationRacesQueueCloseSafely(t *testing.T) {
+	device := newCrossQueueDevice(t, 4000)
+	queue := parkedQueue(t, device)
+	conns := make([]*GoConn, 8)
+	for index := range conns {
+		conns[index] = &GoConn{}
+	}
+	var waitGroup sync.WaitGroup
+	for _, conn := range conns {
+		waitGroup.Add(1)
+		go func(conn *GoConn) {
+			defer waitGroup.Done()
+			for iteration := 0; iteration < 500; iteration++ {
+				queue.noteWait(conn, int64(100+iteration))
+				queue.dropWait(conn)
+			}
+		}(conn)
+	}
+	waitGroup.Add(1)
+	go func() {
+		defer waitGroup.Done()
+		_ = queue.Close()
+	}()
+	waitGroup.Wait()
+	for index, conn := range conns {
+		queue.waitAccess.Lock()
+		owned, need := conn.waitQueue, conn.pendingNeed
+		queue.waitAccess.Unlock()
+		if (owned == nil) != (need == 0) {
+			t.Fatalf("conn %d is inconsistent after the close: queue=%p need=%d", index, owned, need)
+		}
+	}
+}

@@ -398,11 +398,15 @@ func (q *OutboundQueue) minWaitNeed() int64 {
 // their own close paths and must not keep claiming this queue's budget).
 func (q *OutboundQueue) clearWaits() {
 	q.waitAccess.Lock()
-	for conn := q.waitHead; conn != nil; conn = conn.waitNext {
+	// Read the link BEFORE clearing it: the loop's next-step read would otherwise see nil
+	// after the first node and leave every other connection owning this closed queue.
+	for conn := q.waitHead; conn != nil; {
+		next := conn.waitNext
 		conn.pendingNeed = 0
 		conn.waitQueue = nil
 		conn.waitPrev = nil
 		conn.waitNext = nil
+		conn = next
 	}
 	q.waitHead = nil
 	q.waitTail = nil
