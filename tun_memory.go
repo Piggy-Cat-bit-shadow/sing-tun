@@ -59,11 +59,16 @@ type MemoryTun struct {
 	inboundHeadroom  atomic.Int32
 	inboundRearSpace atomic.Int32
 	outbound         *OutboundQueue
-	writableAccess   sync.Mutex
-	writable         []*OutboundQueue
-	writablePending  atomic.Bool
-	engineWake       goSignal
-	closeSignal      chan struct{}
+	// queues is the device registry of every outbound queue (the default one and the
+	// caller-owned ones): the byte budget is shared, so any release may have to wake a
+	// waiter parked in a DIFFERENT queue.
+	queuesAccess    sync.Mutex
+	queues          map[*OutboundQueue]struct{}
+	writableAccess  sync.Mutex
+	writable        []*OutboundQueue
+	writablePending atomic.Bool
+	engineWake      goSignal
+	closeSignal     chan struct{}
 }
 
 func NewMemoryTun(options MemoryTunOptions) *MemoryTun {
@@ -85,6 +90,7 @@ func NewMemoryTun(options MemoryTunOptions) *MemoryTun {
 		outboundHandler = buf.ReleaseMulti
 	}
 	memoryTun.inboundWritable = sync.NewCond(&memoryTun.inboundAccess)
+	memoryTun.queues = make(map[*OutboundQueue]struct{})
 	maxQueuedBytes := options.MaxQueuedBytes
 	if maxQueuedBytes <= 0 {
 		maxQueuedBytes = DefaultMemoryTunMaxQueuedBytes
@@ -306,6 +312,9 @@ func (t *MemoryTun) releaseQueuedBytes(n int64) {
 	}
 	t.releaseQueuedBytesLocked(n)
 	t.notifyByteWaiters()
+	// The same release may unblock a data writer parked in ANY outbound queue: the budget
+	// is one device-wide number, so the wake cannot be scoped to the releasing queue.
+	t.notifyOutboundByteWaiters()
 }
 
 // releaseQueuedBytesLocked returns n to the device-wide budget without notifying. Callers
@@ -330,18 +339,25 @@ func (t *MemoryTun) releaseQueuedBytesLocked(n int64) {
 // device's own queue is tracked here; a caller-owned queue is woken by its own drain.
 // Callers must not hold the inbound lock or the queue lock (see readBurst).
 func (t *MemoryTun) notifyOutboundByteWaiters() {
-	queue := t.outbound
-	if queue == nil {
+	if !t.hasQueuedByteRoom(1) {
+		// Nothing fits yet: leaving the queues armed means the next release tries again.
 		return
 	}
-	queue.access.Lock()
-	armed := queue.transmitInterest && !queue.closed.Load() && !queue.data.full() && t.hasQueuedByteRoom(1)
-	if armed {
-		queue.transmitInterest = false
+	t.queuesAccess.Lock()
+	queues := make([]*OutboundQueue, 0, len(t.queues))
+	for queue := range t.queues {
+		queues = append(queues, queue)
 	}
-	queue.access.Unlock()
-	if armed {
-		t.queueWritable(queue)
+	t.queuesAccess.Unlock()
+	for _, queue := range queues {
+		if queue.closed.Load() {
+			continue
+		}
+		// transmitInterest is atomic precisely so this cross-queue notification does not
+		// take another queue's access lock (release paths hold their own queue's lock).
+		if queue.transmitInterest.CompareAndSwap(true, false) {
+			t.queueWritable(queue)
+		}
 	}
 }
 

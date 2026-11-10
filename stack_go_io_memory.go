@@ -229,9 +229,9 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 	queue.access.Lock()
 	// The packet ring OR the device byte budget can be what blocks a data write; both arm
 	// the writer, and both are retried when the queue drains or the budget is released.
-	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest)
+	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest.Load())
 	if armed {
-		queue.transmitInterest = true
+		queue.transmitInterest.Store(true)
 	}
 	queue.access.Unlock()
 	if !armed {
@@ -281,6 +281,9 @@ func (o *goMemoryIO) close() error {
 	}
 	o.tun.inboundWritable.Broadcast()
 	o.tun.inboundAccess.Unlock()
+	// The drained frames return device bytes, so a data writer parked on the shared
+	// budget in any outbound queue must be handed to the engine as well.
+	o.tun.notifyOutboundByteWaiters()
 	if o.timer != nil {
 		o.timer.Stop()
 	}

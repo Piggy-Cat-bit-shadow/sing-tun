@@ -20,7 +20,7 @@ type OutboundQueue struct {
 	// queuedBytes is what this queue holds of the device byte budget (see
 	// MemoryTun.maxQueuedBytes). It is under access like the rings it describes.
 	queuedBytes      int64
-	transmitInterest bool
+	transmitInterest atomic.Bool
 	writableQueued   bool
 	closed           atomic.Bool
 	readerWake       goSignal
@@ -37,8 +37,19 @@ func (t *MemoryTun) NewOutboundQueue(handler func(packets []*buf.Buffer)) *Outbo
 		readerWake:  make(goSignal, 1),
 		closeSignal: make(chan struct{}),
 	}
+	t.queuesAccess.Lock()
+	t.queues[queue] = struct{}{}
+	t.queuesAccess.Unlock()
 	go queue.loopHandle()
 	return queue
+}
+
+// unregisterOutboundQueue removes a closed queue from the device registry: the byte
+// budget is device-wide, so only the owner of a live queue may be woken for it.
+func (t *MemoryTun) unregisterOutboundQueue(queue *OutboundQueue) {
+	t.queuesAccess.Lock()
+	delete(t.queues, queue)
+	t.queuesAccess.Unlock()
 }
 
 func (q *OutboundQueue) WriteBuffers(buffers []*buf.Buffer) {
@@ -74,8 +85,9 @@ func (q *OutboundQueue) Close() error {
 	q.releaseRingLocked(&q.data)
 	q.dataQueued.Store(0)
 	q.queuedBytes = 0
-	q.transmitInterest = false
+	q.transmitInterest.Store(false)
 	q.access.Unlock()
+	q.tun.unregisterOutboundQueue(q)
 	close(q.closeSignal)
 	q.tun.queueWritable(q)
 	return nil
@@ -112,9 +124,13 @@ func (q *OutboundQueue) drain(buffers []*buf.Buffer) int {
 		buffers[count] = buffer
 		count++
 	}
-	writable := q.transmitInterest && !q.data.full()
+	// Only a drain that actually dequeued a packet has freed ring space or bytes, so only
+	// then may it consume the interest. Clearing it on an empty drain (the loop's first
+	// pass, a spurious wake) disarms a writer that is still blocked: no release happened,
+	// and the later real release would find nothing to hand to the engine.
+	writable := count > 0 && q.transmitInterest.Load() && !q.data.full()
 	if writable {
-		q.transmitInterest = false
+		q.transmitInterest.Store(false)
 	}
 	q.access.Unlock()
 	if writable {
@@ -174,7 +190,7 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 			// A TCP segment blocked only by the device byte budget is backpressure, not a
 			// drop: the writer must be armed and retried when the queue drains or the
 			// reader frees the budget. UDP keeps the drop policy.
-			q.transmitInterest = true
+			q.transmitInterest.Store(true)
 			err = errGoTransmitBlocked
 		} else {
 			err = errGoFrameDropped
@@ -189,7 +205,7 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		}
 		if !q.reserveBytesExactLocked(fragmentsBytes) {
 			if class == goOutboundData {
-				q.transmitInterest = true
+				q.transmitInterest.Store(true)
 				err = errGoTransmitBlocked
 			} else {
 				err = errGoFrameDropped
@@ -197,6 +213,7 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		}
 	}
 	if err != nil {
+
 		q.access.Unlock()
 		packet.Release()
 		return err
