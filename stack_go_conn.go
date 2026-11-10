@@ -227,15 +227,20 @@ type GoConn struct {
 	ident              atomic.Uint32
 	windowLimitedSince atomic.Bool
 	outboundQueue      atomic.Pointer[OutboundQueue]
-	transmitStore      goTransmitStore
-	descriptors        goDescriptorRing
-	transmitScratch    [goHeaderScratchSize]byte
-	transmitSegments   [][]byte
-	blockedSegment     goSegment
-	blockedFrame       [][]byte
-	blockedMeta        ForwardFrameMeta
-	blockedValid       bool
-	_                  [64]byte
+	// pendingNeed is the byte size this connection's last data frame was refused at by
+	// the device budget (0 = none). It is guarded by the owning queue's access lock and
+	// lets a queue aggregate the MINIMUM need of its waiters instead of the most recent
+	// one: a queued 3,000-byte frame must not hide a 1,000-byte waiter that could proceed.
+	pendingNeed      int64
+	transmitStore    goTransmitStore
+	descriptors      goDescriptorRing
+	transmitScratch  [goHeaderScratchSize]byte
+	transmitSegments [][]byte
+	blockedSegment   goSegment
+	blockedFrame     [][]byte
+	blockedMeta      ForwardFrameMeta
+	blockedValid     bool
+	_                [64]byte
 
 	writeAccess   sync.Mutex
 	bufferedTail  atomic.Uint64

@@ -352,7 +352,7 @@ func (t *MemoryTun) notifyOutboundByteWaiters() {
 		if queue.closed.Load() {
 			continue
 		}
-		needed := queue.byteBlocked.Load()
+		needed := queue.minNeed()
 		if needed <= 0 {
 			needed = 1
 		}

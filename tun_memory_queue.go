@@ -20,10 +20,13 @@ type OutboundQueue struct {
 	// queuedBytes is what this queue holds of the device byte budget (see
 	// MemoryTun.maxQueuedBytes). It is under access like the rings it describes.
 	queuedBytes int64
-	// byteBlocked is the payload size of the most recent data frame refused only by the
-	// device byte budget (0 when unknown). It lets the wake path ask "does the release
-	// actually fit a blocked frame?" instead of waking on a single byte and spinning.
-	byteBlocked      atomic.Int64
+	// needs is the multiset of byte sizes currently refused by the device budget for this
+	// queue's data writers, keyed by frame size. The wake path uses its MINIMUM: a release
+	// that fits the smallest blocked frame lets that writer progress even if a larger frame
+	// is also waiting. Entries are added on refusal and removed when the owning conn's
+	// retry (or a later enqueue) succeeds.
+	needsAccess      sync.Mutex
+	needs            map[int64]int
 	transmitInterest atomic.Bool
 	writableQueued   bool
 	closed           atomic.Bool
@@ -89,6 +92,7 @@ func (q *OutboundQueue) Close() error {
 	q.releaseRingLocked(&q.data)
 	q.dataQueued.Store(0)
 	q.queuedBytes = 0
+	q.clearNeeds()
 	q.transmitInterest.Store(false)
 	q.access.Unlock()
 	q.tun.unregisterOutboundQueue(q)
@@ -132,7 +136,7 @@ func (q *OutboundQueue) drain(buffers []*buf.Buffer) int {
 	// then may it consume the interest. Clearing it on an empty drain (the loop's first
 	// pass, a spurious wake) disarms a writer that is still blocked: no release happened,
 	// and the later real release would find nothing to hand to the engine.
-	needed := q.byteBlocked.Load()
+	needed := q.minNeed()
 	writable := count > 0 && q.transmitInterest.Load() && !q.data.full() &&
 		(needed <= 0 || q.tun.hasQueuedByteRoom(needed))
 	if writable {
@@ -180,6 +184,7 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 	case goOutboundData:
 		ring = &q.data
 	}
+
 	var err error
 	switch {
 	case q.closed.Load() || q.tun.closed.Load():
@@ -202,10 +207,11 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 			if byteBlockedHook != nil {
 				byteBlockedHook()
 			}
-			q.byteBlocked.Store(int64(packet.Cap()))
+			q.noteNeedLocked(owner, int64(packet.Cap()))
 			q.transmitInterest.Store(true)
 			if q.reserveBytesLocked(packet) {
 				// The retry fits: queue the frame instead of parking the writer.
+				q.clearNeedLocked(owner)
 				err = nil
 			} else {
 				err = errGoTransmitBlocked
@@ -226,9 +232,10 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 				if byteBlockedHook != nil {
 					byteBlockedHook()
 				}
-				q.byteBlocked.Store(fragmentsBytes)
+				q.noteNeedLocked(owner, fragmentsBytes)
 				q.transmitInterest.Store(true)
 				if q.reserveBytesExactLocked(fragmentsBytes) {
+					q.clearNeedLocked(owner)
 					err = nil
 				} else {
 					err = errGoTransmitBlocked
@@ -244,10 +251,10 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		packet.Release()
 		return err
 	}
-	// A successful data admission clears the recorded blocked size: a stale, larger value
-	// would make the next release wait for more room than the current waiter needs.
+	// A successful data admission clears this connection's recorded need: a stale entry
+	// would keep the queue's minimum waiting for room nobody requires any more.
 	if class == goOutboundData {
-		q.byteBlocked.Store(0)
+		q.clearNeedLocked(owner)
 	}
 	wasEmpty := q.emptyLocked()
 	if fragments == nil {
@@ -304,6 +311,65 @@ func (q *OutboundQueue) QueuedBytes() int {
 	q.access.Lock()
 	defer q.access.Unlock()
 	return int(q.queuedBytes)
+}
+
+// noteNeedLocked records that owner's data frame of need bytes was refused by the device
+// budget. Caller holds q.access; the owner field is written under the same lock.
+func (q *OutboundQueue) noteNeedLocked(owner *GoConn, need int64) {
+	if need <= 0 {
+		return
+	}
+	q.needsAccess.Lock()
+	if q.needs == nil {
+		q.needs = make(map[int64]int)
+	}
+	q.needs[need]++
+	q.needsAccess.Unlock()
+	if owner != nil {
+		owner.pendingNeed = need
+	}
+}
+
+// clearNeedLocked removes the need recorded for owner (its retry, or a later enqueue of
+// the same conn, succeeded). Caller holds q.access.
+func (q *OutboundQueue) clearNeedLocked(owner *GoConn) {
+	if owner == nil || owner.pendingNeed <= 0 {
+		return
+	}
+	need := owner.pendingNeed
+	owner.pendingNeed = 0
+	q.needsAccess.Lock()
+	if count := q.needs[need]; count <= 1 {
+		delete(q.needs, need)
+	} else {
+		q.needs[need] = count - 1
+	}
+	q.needsAccess.Unlock()
+}
+
+// minNeed reports the smallest frame size currently refused by the budget (0 = none).
+// Using the minimum is what lets a 1,000-byte waiter proceed while a 3,000-byte frame is
+// also queued: the most recent refusal would hide it behind the larger size.
+func (q *OutboundQueue) minNeed() int64 {
+	q.needsAccess.Lock()
+	defer q.needsAccess.Unlock()
+	var minimum int64
+	for need, count := range q.needs {
+		if count <= 0 {
+			continue
+		}
+		if minimum == 0 || need < minimum {
+			minimum = need
+		}
+	}
+	return minimum
+}
+
+// clearNeeds drops every recorded need (the queue is closing).
+func (q *OutboundQueue) clearNeeds() {
+	q.needsAccess.Lock()
+	q.needs = nil
+	q.needsAccess.Unlock()
 }
 
 func (q *OutboundQueue) pushLocked(ring *goPacketRing, packet *buf.Buffer, owner *GoConn, segmentEnd uint64) {
