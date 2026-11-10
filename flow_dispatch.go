@@ -171,6 +171,10 @@ type ForwardDispatcher struct {
 	stages          []*ForwardStage
 	stageCount      atomic.Int32
 	resetGeneration atomic.Uint32
+	// identification numbers the synthesized IPv4 packets this dispatcher builds itself (the DNS
+	// hijack's replies): sharing one constant ID across every reply makes a reassembling peer
+	// stitch unrelated datagrams together, so each synthesized packet takes the next value.
+	identification atomic.Uint32
 }
 
 type stagedPort struct {
