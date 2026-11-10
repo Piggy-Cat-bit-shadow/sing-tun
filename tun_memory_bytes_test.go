@@ -176,15 +176,21 @@ func TestMemoryTunQueuedBytesReturnToZeroOnClose(t *testing.T) {
 	if got := memoryTun.QueuedBytes(); got == 0 {
 		t.Fatal("nothing was queued: the test would pass vacuously")
 	}
-	close(hold)
+	// Keep the handler blocked for the comparison: a draining queue would move both
+	// counters between the two reads and make the equality a scheduling race.
 	if err := memoryTun.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	// The caller-owned queue still holds its datagrams until it is closed itself; the
 	// device total must reflect that (only the default queue and the inbound ring are the
-	// device's to release).
-	if got := memoryTun.QueuedBytes(); got != queue.QueuedBytes() {
-		t.Fatalf("device total %d after Close, want the caller queue's %d", got, queue.QueuedBytes())
+	// device's to release). Both counters are read under the queue lock: the queue loop
+	// pops (and releases) between two unlocked reads, which is a test race, not a defect.
+	queue.access.Lock()
+	deviceAfter := memoryTun.QueuedBytes()
+	queueAfter := int(queue.queuedBytes)
+	queue.access.Unlock()
+	if deviceAfter != queueAfter {
+		t.Fatalf("device total %d after Close, want the caller queue's %d", deviceAfter, queueAfter)
 	}
 	if err := queue.Close(); err != nil {
 		t.Fatalf("queue Close: %v", err)
@@ -192,6 +198,7 @@ func TestMemoryTunQueuedBytesReturnToZeroOnClose(t *testing.T) {
 	if got := memoryTun.QueuedBytes(); got != 0 {
 		t.Fatalf("queued bytes %d after the caller queue closed, want 0", got)
 	}
+	close(hold)
 	if got := memoryTun.MaxQueuedBytes(); got != 1<<20 {
 		t.Fatalf("reported cap %d, want 1048576", got)
 	}

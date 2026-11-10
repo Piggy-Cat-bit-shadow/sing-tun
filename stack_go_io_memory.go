@@ -229,7 +229,9 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 	queue.access.Lock()
 	// The packet ring OR the device byte budget can be what blocks a data write; both arm
 	// the writer, and both are retried when the queue drains or the budget is released.
-	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest.Load())
+	// byteBlocked covers the case where a release consumed the interest between the failed
+	// reservation and this arm: the writer is still blocked even though interest is false.
+	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest.Load() || queue.byteBlocked.Load() > 0)
 	if armed {
 		queue.transmitInterest.Store(true)
 	}
@@ -241,6 +243,13 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 	if waiters == nil {
 		waiters = new(goBlockedWriters)
 		o.blocked[queue] = waiters
+	}
+	// Re-observe the budget AFTER publishing the interest and registering the group: a
+	// release that happened inside that window queued the queue before this group existed,
+	// so it must be re-queued now that the group can be delivered. The size check keeps a
+	// partial release from spinning the writer.
+	if needed := queue.byteBlocked.Load(); needed > 0 && !queue.data.full() && o.tun.hasQueuedByteRoom(needed) {
+		o.tun.queueWritable(queue)
 	}
 	return waiters, nil
 }

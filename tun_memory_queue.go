@@ -19,7 +19,11 @@ type OutboundQueue struct {
 	dataQueued atomic.Int32
 	// queuedBytes is what this queue holds of the device byte budget (see
 	// MemoryTun.maxQueuedBytes). It is under access like the rings it describes.
-	queuedBytes      int64
+	queuedBytes int64
+	// byteBlocked is the payload size of the most recent data frame refused only by the
+	// device byte budget (0 when unknown). It lets the wake path ask "does the release
+	// actually fit a blocked frame?" instead of waking on a single byte and spinning.
+	byteBlocked      atomic.Int64
 	transmitInterest atomic.Bool
 	writableQueued   bool
 	closed           atomic.Bool
@@ -128,7 +132,9 @@ func (q *OutboundQueue) drain(buffers []*buf.Buffer) int {
 	// then may it consume the interest. Clearing it on an empty drain (the loop's first
 	// pass, a spurious wake) disarms a writer that is still blocked: no release happened,
 	// and the later real release would find nothing to hand to the engine.
-	writable := count > 0 && q.transmitInterest.Load() && !q.data.full()
+	needed := q.byteBlocked.Load()
+	writable := count > 0 && q.transmitInterest.Load() && !q.data.full() &&
+		(needed <= 0 || q.tun.hasQueuedByteRoom(needed))
 	if writable {
 		q.transmitInterest.Store(false)
 	}
@@ -188,10 +194,22 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 	if err == nil && fragments == nil && !q.reserveBytesLocked(packet) {
 		if class == goOutboundData {
 			// A TCP segment blocked only by the device byte budget is backpressure, not a
-			// drop: the writer must be armed and retried when the queue drains or the
-			// reader frees the budget. UDP keeps the drop policy.
+			// drop. The window this closes: a release between the failed reservation and
+			// the publish below cannot see our interest, so its notification is lost.
+			// Publishing the interest and then RETRYING the reservation makes that release
+			// either observed by the retry (the frame queues now) or by the notifier (the
+			// interest is already visible).
+			if byteBlockedHook != nil {
+				byteBlockedHook()
+			}
+			q.byteBlocked.Store(int64(packet.Cap()))
 			q.transmitInterest.Store(true)
-			err = errGoTransmitBlocked
+			if q.reserveBytesLocked(packet) {
+				// The retry fits: queue the frame instead of parking the writer.
+				err = nil
+			} else {
+				err = errGoTransmitBlocked
+			}
 		} else {
 			err = errGoFrameDropped
 		}
@@ -205,8 +223,16 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		}
 		if !q.reserveBytesExactLocked(fragmentsBytes) {
 			if class == goOutboundData {
+				if byteBlockedHook != nil {
+					byteBlockedHook()
+				}
+				q.byteBlocked.Store(fragmentsBytes)
 				q.transmitInterest.Store(true)
-				err = errGoTransmitBlocked
+				if q.reserveBytesExactLocked(fragmentsBytes) {
+					err = nil
+				} else {
+					err = errGoTransmitBlocked
+				}
 			} else {
 				err = errGoFrameDropped
 			}
@@ -217,6 +243,11 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 		q.access.Unlock()
 		packet.Release()
 		return err
+	}
+	// A successful data admission clears the recorded blocked size: a stale, larger value
+	// would make the next release wait for more room than the current waiter needs.
+	if class == goOutboundData {
+		q.byteBlocked.Store(0)
 	}
 	wasEmpty := q.emptyLocked()
 	if fragments == nil {
@@ -284,6 +315,11 @@ func (q *OutboundQueue) pushLocked(ring *goPacketRing, packet *buf.Buffer, owner
 	}
 	ring.push(packet, owner, segmentEnd)
 }
+
+// byteBlockedHook is the test seam for the reservation-failure -> interest-publish window:
+// it runs after a byte-budget refusal and before the interest is published, so a test can
+// make another queue release the budget exactly inside the window.
+var byteBlockedHook func()
 
 const goPacketRingInitialSize = 16
 

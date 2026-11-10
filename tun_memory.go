@@ -335,14 +335,13 @@ func (t *MemoryTun) releaseQueuedBytesLocked(n int64) {
 	}
 }
 
-// notifyOutboundByteWaiters hands a byte-blocked outbound queue to the engine. Only the
-// device's own queue is tracked here; a caller-owned queue is woken by its own drain.
+// notifyOutboundByteWaiters hands a byte-blocked outbound queue to the engine. Every
+// registered queue is considered, because the released bytes belong to the device and any
+// queue may have been the one waiting for them. The size check uses the queue's recorded
+// blocked frame: a partial release that cannot fit a blocked frame must leave the queue
+// armed (the next release re-checks) instead of waking it into another refusal.
 // Callers must not hold the inbound lock or the queue lock (see readBurst).
 func (t *MemoryTun) notifyOutboundByteWaiters() {
-	if !t.hasQueuedByteRoom(1) {
-		// Nothing fits yet: leaving the queues armed means the next release tries again.
-		return
-	}
 	t.queuesAccess.Lock()
 	queues := make([]*OutboundQueue, 0, len(t.queues))
 	for queue := range t.queues {
@@ -351,6 +350,13 @@ func (t *MemoryTun) notifyOutboundByteWaiters() {
 	t.queuesAccess.Unlock()
 	for _, queue := range queues {
 		if queue.closed.Load() {
+			continue
+		}
+		needed := queue.byteBlocked.Load()
+		if needed <= 0 {
+			needed = 1
+		}
+		if !t.hasQueuedByteRoom(needed) {
 			continue
 		}
 		// transmitInterest is atomic precisely so this cross-queue notification does not
