@@ -227,11 +227,14 @@ type GoConn struct {
 	ident              atomic.Uint32
 	windowLimitedSince atomic.Bool
 	outboundQueue      atomic.Pointer[OutboundQueue]
-	// pendingNeed is the byte size this connection's last data frame was refused at by
-	// the device budget (0 = none). It is guarded by the owning queue's access lock and
-	// lets a queue aggregate the MINIMUM need of its waiters instead of the most recent
-	// one: a queued 3,000-byte frame must not hide a 1,000-byte waiter that could proceed.
+	// pendingNeed is the byte size this connection's data frame was refused at by the
+	// device budget (0 = none) and waitQueue is the queue whose waiter list owns the record.
+	// Both are guarded by that queue's waitAccess; the links are the queue's intrusive
+	// waiter list. One record per connection, updated in place on a repeated refusal.
 	pendingNeed      int64
+	waitQueue        *OutboundQueue
+	waitPrev         *GoConn
+	waitNext         *GoConn
 	transmitStore    goTransmitStore
 	descriptors      goDescriptorRing
 	transmitScratch  [goHeaderScratchSize]byte
@@ -700,12 +703,10 @@ func (c *GoConn) Close() error {
 		return nil
 	}
 	c.userClosed = true
-	// A cancelled writer must not leave its blocked-frame size behind: the queue would keep
-	// waking for a frame nobody will retry (see OutboundQueue.noteNeedLocked).
+	// A cancelled writer must not leave its blocked-frame record behind: the queue would keep
+	// waking for a frame nobody will retry (see OutboundQueue.noteWait).
 	if queue := c.outboundQueue.Load(); queue != nil {
-		queue.access.Lock()
-		queue.clearNeedLocked(c)
-		queue.access.Unlock()
+		queue.dropWait(c)
 	}
 	c.writeShut = true
 	c.readShut = true

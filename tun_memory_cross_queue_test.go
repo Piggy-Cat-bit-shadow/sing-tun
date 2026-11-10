@@ -91,8 +91,9 @@ func TestInboundReadWakesARouteQueueDataWaiter(t *testing.T) {
 	conn.outboundQueue.Store(route)
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
 
-	// A TCP data frame for the route queue, blocked only by the byte budget.
-	if err := route.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	// A TCP data frame for the route queue, blocked only by the byte budget. Data-class
+	// frames carry their connection: the waiter record lives on it.
+	if err := route.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("route data enqueue = %v, want errGoTransmitBlocked", err)
 	}
 	waiters, err := io.armTransmitWritable(conn)
@@ -118,7 +119,7 @@ func TestInboundReadWakesARouteQueueDataWaiter(t *testing.T) {
 		t.Fatal("the inbound read did not hand the route queue's byte-blocked data writer to the engine")
 	}
 	// The original frame must actually retry and enqueue.
-	if err := route.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); err != nil {
+	if err := route.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the inbound read: %v", err)
 	}
 }
@@ -148,10 +149,12 @@ func TestAnotherQueueCloseWakesTheDefaultQueueDataWaiter(t *testing.T) {
 	waitForBytes(t, "the budget held by the extra queue", func() bool { return device.QueuedBytes() == 4000 })
 
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	conn := &GoConn{}
+	conn.outboundQueue.Store(device.outbound)
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("default data enqueue = %v, want errGoTransmitBlocked", err)
 	}
-	waiters, err := io.armTransmitWritable(nil)
+	waiters, err := io.armTransmitWritable(conn)
 	if err != nil || waiters == nil {
 		t.Fatalf("the default data writer was not armed: (%v, %v)", waiters, err)
 	}
@@ -166,7 +169,7 @@ func TestAnotherQueueCloseWakesTheDefaultQueueDataWaiter(t *testing.T) {
 	if len(woken) == 0 {
 		t.Fatal("the other queue's Close did not hand the default queue's data writer to the engine")
 	}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); err != nil {
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the other queue closed: %v", err)
 	}
 }
@@ -197,10 +200,12 @@ func TestRouteQueueDrainWakesTheDefaultQueueDataWaiter(t *testing.T) {
 	waitForBytes(t, "the budget held by the extra queue", func() bool { return device.QueuedBytes() == 4000 })
 
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	conn := &GoConn{}
+	conn.outboundQueue.Store(device.outbound)
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("default data enqueue = %v, want errGoTransmitBlocked", err)
 	}
-	if waiters, err := io.armTransmitWritable(nil); err != nil || waiters == nil {
+	if waiters, err := io.armTransmitWritable(conn); err != nil || waiters == nil {
 		t.Fatalf("the default data writer was not armed: (%v, %v)", waiters, err)
 	}
 
@@ -214,7 +219,7 @@ func TestRouteQueueDrainWakesTheDefaultQueueDataWaiter(t *testing.T) {
 	if len(woken) == 0 {
 		t.Fatal("the extra queue's drain did not hand the default queue's data writer to the engine")
 	}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); err != nil {
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the drain: %v", err)
 	}
 }
@@ -232,10 +237,12 @@ func TestDetachWakesAByteBlockedDataWriter(t *testing.T) {
 	waitForBytes(t, "the device budget full", func() bool { return device.QueuedBytes() == 4000 })
 
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	conn := &GoConn{}
+	conn.outboundQueue.Store(device.outbound)
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("default data enqueue = %v, want errGoTransmitBlocked", err)
 	}
-	if waiters, err := io.armTransmitWritable(nil); err != nil || waiters == nil {
+	if waiters, err := io.armTransmitWritable(conn); err != nil || waiters == nil {
 		t.Fatalf("the default data writer was not armed: (%v, %v); interest=%v dataCount=%d device=%d",
 			waiters, err, device.outbound.transmitInterest.Load(), device.outbound.data.count, device.QueuedBytes())
 	}
@@ -248,7 +255,7 @@ func TestDetachWakesAByteBlockedDataWriter(t *testing.T) {
 	if len(woken) == 0 {
 		t.Fatal("the detach did not hand the default queue's byte-blocked data writer to the engine")
 	}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); err != nil {
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the detach: %v", err)
 	}
 }
@@ -264,10 +271,12 @@ func TestDeviceCloseCancelsAByteBlockedDataWriter(t *testing.T) {
 		t.Fatalf("inbound write = (%d, %v)", accepted, err)
 	}
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
-	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	conn := &GoConn{}
+	conn.outboundQueue.Store(device.outbound)
+	if err := device.outbound.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("default data enqueue = %v, want errGoTransmitBlocked", err)
 	}
-	if waiters, err := io.armTransmitWritable(nil); err != nil || waiters == nil {
+	if waiters, err := io.armTransmitWritable(conn); err != nil || waiters == nil {
 		t.Fatalf("the default data writer was not armed: (%v, %v)", waiters, err)
 	}
 	if err := device.Close(); err != nil {

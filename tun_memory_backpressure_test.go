@@ -117,11 +117,13 @@ func TestInboundReadWakesAByteBlockedDataWriter(t *testing.T) {
 	}
 	waitForBytes(t, "the device budget full", func() bool { return device.QueuedBytes() == 4000 })
 
-	// A TCP segment is byte-blocked.
-	if err := device.outbound.enqueue(buf.NewSize(500), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	// A TCP segment is byte-blocked; data frames carry their connection.
+	conn := &GoConn{}
+	conn.outboundQueue.Store(device.outbound)
+	if err := device.outbound.enqueue(buf.NewSize(500), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("byte-blocked data write = %v, want errGoTransmitBlocked", err)
 	}
-	if waiters, err := io.armTransmitWritable(nil); err != nil || waiters == nil {
+	if waiters, err := io.armTransmitWritable(conn); err != nil || waiters == nil {
 		t.Fatalf("the data writer was not armed: (%v, %v)", waiters, err)
 	}
 
@@ -142,7 +144,7 @@ func TestInboundReadWakesAByteBlockedDataWriter(t *testing.T) {
 	if len(woken) == 0 {
 		t.Fatal("the inbound read did not hand the byte-blocked outbound writer to the engine")
 	}
-	if err := device.outbound.enqueue(buf.NewSize(500), nil, goOutboundData, nil, 0); err != nil {
+	if err := device.outbound.enqueue(buf.NewSize(500), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the inbound read: %v", err)
 	}
 	close(hold)

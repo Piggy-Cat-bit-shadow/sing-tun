@@ -142,53 +142,61 @@ func TestTheSmallestBlockedFrameIsNotMaskedByALargerOne(t *testing.T) {
 	}
 }
 
-// TestNeedMultisetIsBounded pins the safety net for cancelled writers: a queue that has
-// seen many refused sizes (one per conn) keeps at most outboundQueueMaxNeeds entries, and a
-// live waiter still wakes after the bound was hit.
-func TestNeedMultisetIsBounded(t *testing.T) {
+// TestWaiterRecordIsPerConnectionAndIdempotent pins the ownership rule that replaces the
+// former size multiset: one record per connection, updated in place on a repeated refusal
+// (no accumulated ghosts), removed by dropWait, and the queue's minimum is computed from
+// the live connections only.
+func TestWaiterRecordIsPerConnectionAndIdempotent(t *testing.T) {
 	device := newCrossQueueDevice(t, 4000)
 	target := parkedQueue(t, device)
-	for index := 0; index < outboundQueueMaxNeeds*2; index++ {
-		conn := &GoConn{}
-		target.access.Lock()
-		target.noteNeedLocked(conn, int64(100+index))
-		target.access.Unlock()
-	}
-	if got := len(target.needs); got > outboundQueueMaxNeeds {
-		t.Fatalf("the need multiset holds %d entries, want at most %d", got, outboundQueueMaxNeeds)
-	}
-	if target.minNeed() <= 0 {
-		t.Fatal("the multiset lost its minimum while waiting")
-	}
-	// A live waiter still gets a group when room appears.
-	target.access.Lock()
-	target.noteNeedLocked(&GoConn{}, 1000)
-	target.access.Unlock()
 	conn := &GoConn{}
 	conn.outboundQueue.Store(target)
-	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
-	if waiters, armErr := io.armTransmitWritable(conn); armErr != nil || waiters == nil {
-		t.Fatalf("the writer was not armed after the bound: (%v, %v)", waiters, armErr)
+
+	target.noteWait(conn, 2000)
+	target.noteWait(conn, 1000) // same writer, smaller retry: update in place
+	target.waitAccess.Lock()
+	count := 0
+	for entry := target.waitHead; entry != nil; entry = entry.waitNext {
+		count++
+	}
+	target.waitAccess.Unlock()
+	if count != 1 {
+		t.Fatalf("the waiter list holds %d records for one connection, want 1", count)
+	}
+	if got := target.minWaitNeed(); got != 1000 {
+		t.Fatalf("minWaitNeed = %d, want the single record's 1000", got)
+	}
+	// A second connection is a second record; the minimum is still exact.
+	other := &GoConn{}
+	other.outboundQueue.Store(target)
+	target.noteWait(other, 3000)
+	if got := target.minWaitNeed(); got != 1000 {
+		t.Fatalf("minWaitNeed = %d after a second writer, want 1000", got)
+	}
+	target.dropWait(conn)
+	if got := target.minWaitNeed(); got != 3000 {
+		t.Fatalf("minWaitNeed = %d after the small writer left, want 3000", got)
+	}
+	target.dropWait(other)
+	if got := target.minWaitNeed(); got != 0 {
+		t.Fatalf("minWaitNeed = %d after all waiters left, want 0", got)
 	}
 }
 
-// TestCancelClearsTheRecordedNeed pins the queue-level cleanup GoConn.Close performs: a
-// cancelled writer's need leaves the multiset, so the queue's minimum moves on.
-func TestCancelClearsTheRecordedNeed(t *testing.T) {
+// TestCancelClearsTheRecordedWait pins the queue-level revoke GoConn.Close performs: a
+// cancelled writer's record leaves the list, so the queue's minimum moves on.
+func TestCancelClearsTheRecordedWait(t *testing.T) {
 	device := newCrossQueueDevice(t, 4000)
 	target := parkedQueue(t, device)
 	conn := &GoConn{}
-	target.access.Lock()
-	target.noteNeedLocked(conn, 1000)
-	target.access.Unlock()
-	if target.minNeed() != 1000 {
-		t.Fatalf("minNeed = %d, want 1000", target.minNeed())
+	conn.outboundQueue.Store(target)
+	target.noteWait(conn, 1000)
+	if target.minWaitNeed() != 1000 {
+		t.Fatalf("minWaitNeed = %d, want 1000", target.minWaitNeed())
 	}
-	// The same body GoConn.Close calls after marking the connection closed.
-	target.access.Lock()
-	target.clearNeedLocked(conn)
-	target.access.Unlock()
-	if got := target.minNeed(); got != 0 {
-		t.Fatalf("a cancelled writer left its need behind: minNeed = %d", got)
+	// The same call GoConn.Close makes.
+	target.dropWait(conn)
+	if got := target.minWaitNeed(); got != 0 {
+		t.Fatalf("a cancelled writer left its record behind: minWaitNeed = %d", got)
 	}
 }

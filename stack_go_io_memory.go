@@ -144,6 +144,12 @@ func (o *goMemoryIO) enqueue(segments [][]byte, class goOutboundClass, owner *Go
 		}
 	}
 	if owner != nil {
+		// The connection's waiter record belongs to exactly one queue: migrate it before
+		// the queue pointer moves, so the old queue cannot keep a live claim and the new
+		// queue never decrements a count it does not own.
+		if previous := owner.outboundQueue.Load(); previous != nil && previous != queue {
+			previous.dropWait(owner)
+		}
 		owner.outboundQueue.Store(queue)
 	}
 	var fragments [][]byte
@@ -232,7 +238,7 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 	// A recorded need covers the case where a release consumed the interest between the
 	// failed reservation and this arm: the writer is still blocked even though interest is
 	// false.
-	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest.Load() || queue.minNeed() > 0)
+	armed := !queue.closed.Load() && (queue.data.full() || queue.transmitInterest.Load() || queue.minWaitNeed() > 0)
 	if armed {
 		queue.transmitInterest.Store(true)
 	}
@@ -252,7 +258,7 @@ func (o *goMemoryIO) armTransmitWritable(conn *GoConn) (*goBlockedWriters, error
 	// an unsynchronized data.full() here raced the pop that decrements count. The size
 	// check keeps a partial release from spinning the writer.
 	queue.access.Lock()
-	need := queue.minNeed()
+	need := queue.minWaitNeed()
 	wake := !queue.closed.Load() && need > 0 && !queue.data.full() && o.tun.hasQueuedByteRoom(need)
 	queue.access.Unlock()
 	if wake {

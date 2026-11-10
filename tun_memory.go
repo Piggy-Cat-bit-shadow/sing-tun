@@ -352,9 +352,11 @@ func (t *MemoryTun) notifyOutboundByteWaiters() {
 		if queue.closed.Load() {
 			continue
 		}
-		needed := queue.minNeed()
+		needed := queue.minWaitNeed()
 		if needed <= 0 {
-			needed = 1
+			// No connection currently waits on this queue's byte budget: there is nobody to
+			// wake, and a one-byte fallback would only produce empty wakeups.
+			continue
 		}
 		if !t.hasQueuedByteRoom(needed) {
 			continue

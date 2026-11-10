@@ -20,13 +20,13 @@ type OutboundQueue struct {
 	// queuedBytes is what this queue holds of the device byte budget (see
 	// MemoryTun.maxQueuedBytes). It is under access like the rings it describes.
 	queuedBytes int64
-	// needs is the multiset of byte sizes currently refused by the device budget for this
-	// queue's data writers, keyed by frame size. The wake path uses its MINIMUM: a release
-	// that fits the smallest blocked frame lets that writer progress even if a larger frame
-	// is also waiting. Entries are added on refusal and removed when the owning conn's
-	// retry (or a later enqueue) succeeds.
-	needsAccess      sync.Mutex
-	needs            map[int64]int
+	// waitAccess guards the intrusive list of connections whose data frames this queue's
+	// device-byte budget refused (waitHead/waitTail plus each conn's pendingNeed and links).
+	// The record lives on the CONNECTION, so there is one per waiting writer, it moves with
+	// the connection, and a repeated refusal updates it instead of accumulating a ghost.
+	waitAccess       sync.Mutex
+	waitHead         *GoConn
+	waitTail         *GoConn
 	transmitInterest atomic.Bool
 	writableQueued   bool
 	closed           atomic.Bool
@@ -92,7 +92,7 @@ func (q *OutboundQueue) Close() error {
 	q.releaseRingLocked(&q.data)
 	q.dataQueued.Store(0)
 	q.queuedBytes = 0
-	q.clearNeeds()
+	q.clearWaits()
 	q.transmitInterest.Store(false)
 	q.access.Unlock()
 	q.tun.unregisterOutboundQueue(q)
@@ -136,7 +136,7 @@ func (q *OutboundQueue) drain(buffers []*buf.Buffer) int {
 	// then may it consume the interest. Clearing it on an empty drain (the loop's first
 	// pass, a spurious wake) disarms a writer that is still blocked: no release happened,
 	// and the later real release would find nothing to hand to the engine.
-	needed := q.minNeed()
+	needed := q.minWaitNeed()
 	writable := count > 0 && q.transmitInterest.Load() && !q.data.full() &&
 		(needed <= 0 || q.tun.hasQueuedByteRoom(needed))
 	if writable {
@@ -207,11 +207,11 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 			if byteBlockedHook != nil {
 				byteBlockedHook()
 			}
-			q.noteNeedLocked(owner, int64(packet.Cap()))
+			q.noteWait(owner, int64(packet.Cap()))
 			q.transmitInterest.Store(true)
 			if q.reserveBytesLocked(packet) {
 				// The retry fits: queue the frame instead of parking the writer.
-				q.clearNeedLocked(owner)
+				q.dropWait(owner)
 				err = nil
 			} else {
 				err = errGoTransmitBlocked
@@ -232,10 +232,10 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 				if byteBlockedHook != nil {
 					byteBlockedHook()
 				}
-				q.noteNeedLocked(owner, fragmentsBytes)
+				q.noteWait(owner, fragmentsBytes)
 				q.transmitInterest.Store(true)
 				if q.reserveBytesExactLocked(fragmentsBytes) {
-					q.clearNeedLocked(owner)
+					q.dropWait(owner)
 					err = nil
 				} else {
 					err = errGoTransmitBlocked
@@ -254,7 +254,7 @@ func (q *OutboundQueue) enqueue(packet *buf.Buffer, fragments [][]byte, class go
 	// A successful data admission clears this connection's recorded need: a stale entry
 	// would keep the queue's minimum waiting for room nobody requires any more.
 	if class == goOutboundData {
-		q.clearNeedLocked(owner)
+		q.dropWait(owner)
 	}
 	wasEmpty := q.emptyLocked()
 	if fragments == nil {
@@ -313,72 +313,101 @@ func (q *OutboundQueue) QueuedBytes() int {
 	return int(q.queuedBytes)
 }
 
-// noteNeedLocked records that owner's data frame of need bytes was refused by the device
-// budget. Caller holds q.access; the owner field is written under the same lock.
-func (q *OutboundQueue) noteNeedLocked(owner *GoConn, need int64) {
-	if need <= 0 {
+// noteWait records that conn's data frame of need bytes was refused by the device
+// budget, and links the conn into this queue's waiter list. One record per connection:
+// a repeated refusal updates the size in place, so a writer cannot accumulate ghosts.
+// The caller must have dropped the conn from any previous queue (goMemoryIO.enqueue does
+// that before it repoints the connection).
+func (q *OutboundQueue) noteWait(conn *GoConn, need int64) {
+	if conn == nil || need <= 0 {
 		return
 	}
-	q.needsAccess.Lock()
-	if q.needs == nil {
-		q.needs = make(map[int64]int)
-	}
-	if len(q.needs) >= outboundQueueMaxNeeds {
-		// Bound the state: a connection cancelled while blocked never clears its entry, so
-		// a long-lived queue could accumulate one per dead writer. Dropping the map is safe:
-		// a live waiter keeps its interest and blocked group, the notify fallback uses one
-		// byte, and its next refusal re-adds the real size.
-		q.needs = make(map[int64]int)
-	}
-	q.needs[need]++
-	q.needsAccess.Unlock()
-	if owner != nil {
-		owner.pendingNeed = need
-	}
-}
-
-// clearNeedLocked removes the need recorded for owner (its retry, or a later enqueue of
-// the same conn, succeeded). Caller holds q.access.
-func (q *OutboundQueue) clearNeedLocked(owner *GoConn) {
-	if owner == nil || owner.pendingNeed <= 0 {
+	q.waitAccess.Lock()
+	if conn.waitQueue == q {
+		conn.pendingNeed = need
+		q.waitAccess.Unlock()
 		return
 	}
-	need := owner.pendingNeed
-	owner.pendingNeed = 0
-	q.needsAccess.Lock()
-	if count := q.needs[need]; count <= 1 {
-		delete(q.needs, need)
+	if conn.waitQueue != nil {
+		// A record on another queue means the migration hook missed this conn; leave it
+		// alone rather than corrupting that queue's list (the drop happens in enqueue).
+		q.waitAccess.Unlock()
+		return
+	}
+	conn.pendingNeed = need
+	conn.waitQueue = q
+	conn.waitPrev = q.waitTail
+	conn.waitNext = nil
+	if q.waitTail == nil {
+		q.waitHead = conn
 	} else {
-		q.needs[need] = count - 1
+		q.waitTail.waitNext = conn
 	}
-	q.needsAccess.Unlock()
+	q.waitTail = conn
+	q.waitAccess.Unlock()
 }
 
-// minNeed reports the smallest frame size currently refused by the budget (0 = none).
-// Using the minimum is what lets a 1,000-byte waiter proceed while a 3,000-byte frame is
-// also queued: the most recent refusal would hide it behind the larger size.
-func (q *OutboundQueue) minNeed() int64 {
-	q.needsAccess.Lock()
-	defer q.needsAccess.Unlock()
+// dropWait removes conn's record from THIS queue (successful retry, cancellation, queue
+// close or migration). It is a no-op when the conn is not owned by this queue, so a
+// caller can never delete another queue's live waiter.
+func (q *OutboundQueue) dropWait(conn *GoConn) {
+	if conn == nil {
+		return
+	}
+	q.waitAccess.Lock()
+	if conn.waitQueue != q {
+		q.waitAccess.Unlock()
+		return
+	}
+	if conn.waitPrev == nil {
+		q.waitHead = conn.waitNext
+	} else {
+		conn.waitPrev.waitNext = conn.waitNext
+	}
+	if conn.waitNext == nil {
+		q.waitTail = conn.waitPrev
+	} else {
+		conn.waitNext.waitPrev = conn.waitPrev
+	}
+	conn.pendingNeed = 0
+	conn.waitQueue = nil
+	conn.waitPrev = nil
+	conn.waitNext = nil
+	q.waitAccess.Unlock()
+}
+
+// minWaitNeed reports the smallest frame size among the connections currently waiting on
+// this queue's device budget (0 = none). It walks the live waiter list, so the answer is
+// exact and cannot be masked by a cap or a ghost entry.
+func (q *OutboundQueue) minWaitNeed() int64 {
+	q.waitAccess.Lock()
+	defer q.waitAccess.Unlock()
 	var minimum int64
-	for need, count := range q.needs {
-		if count <= 0 {
+	for conn := q.waitHead; conn != nil; conn = conn.waitNext {
+		if conn.pendingNeed <= 0 {
 			continue
 		}
-		if minimum == 0 || need < minimum {
-			minimum = need
+		if minimum == 0 || conn.pendingNeed < minimum {
+			minimum = conn.pendingNeed
 		}
 	}
 	return minimum
 }
 
-// clearNeeds drops every recorded need (the queue is closing).
-func (q *OutboundQueue) clearNeeds() {
-	q.needsAccess.Lock()
-	q.needs = nil
-	q.needsAccess.Unlock()
+// clearWaits drops every waiter record (the queue is closing; the conns are cancelled by
+// their own close paths and must not keep claiming this queue's budget).
+func (q *OutboundQueue) clearWaits() {
+	q.waitAccess.Lock()
+	for conn := q.waitHead; conn != nil; conn = conn.waitNext {
+		conn.pendingNeed = 0
+		conn.waitQueue = nil
+		conn.waitPrev = nil
+		conn.waitNext = nil
+	}
+	q.waitHead = nil
+	q.waitTail = nil
+	q.waitAccess.Unlock()
 }
-
 func (q *OutboundQueue) pushLocked(ring *goPacketRing, packet *buf.Buffer, owner *GoConn, segmentEnd uint64) {
 	if owner != nil {
 		owner.frameEnqueued(packet.Len())

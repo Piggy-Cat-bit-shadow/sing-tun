@@ -103,7 +103,9 @@ func TestReleaseBeforeArmStillDeliversTheGroup(t *testing.T) {
 	waitForBytes(t, "the device budget held", func() bool { return device.QueuedBytes() == 3600 })
 
 	// The target's data frame is refused and publishes its interest.
-	if err := target.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); !errors.Is(err, errGoTransmitBlocked) {
+	conn := &GoConn{}
+	conn.outboundQueue.Store(target)
+	if err := target.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("target data enqueue = %v, want errGoTransmitBlocked", err)
 	}
 	// The release happens now: the notifier sees the interest, clears it and queues the
@@ -113,8 +115,6 @@ func TestReleaseBeforeArmStillDeliversTheGroup(t *testing.T) {
 	}
 	waitForBytes(t, "the release", func() bool { return device.QueuedBytes() == 0 })
 
-	conn := &GoConn{}
-	conn.outboundQueue.Store(target)
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
 	waiters, armErr := io.armTransmitWritable(conn)
 	if armErr != nil {
@@ -128,7 +128,7 @@ func TestReleaseBeforeArmStillDeliversTheGroup(t *testing.T) {
 		t.Fatal("the arm did not re-queue the group after the release had already consumed the interest")
 	}
 	// The retry now fits and queues the original frame.
-	if err := target.enqueue(buf.NewSize(1000), nil, goOutboundData, nil, 0); err != nil {
+	if err := target.enqueue(buf.NewSize(1000), nil, goOutboundData, conn, 0); err != nil {
 		t.Fatalf("the retry after the early release: %v", err)
 	}
 	if got := target.data.count; got != 1 {
