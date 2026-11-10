@@ -700,6 +700,13 @@ func (c *GoConn) Close() error {
 		return nil
 	}
 	c.userClosed = true
+	// A cancelled writer must not leave its blocked-frame size behind: the queue would keep
+	// waking for a frame nobody will retry (see OutboundQueue.noteNeedLocked).
+	if queue := c.outboundQueue.Load(); queue != nil {
+		queue.access.Lock()
+		queue.clearNeedLocked(c)
+		queue.access.Unlock()
+	}
 	c.writeShut = true
 	c.readShut = true
 	linger := c.linger

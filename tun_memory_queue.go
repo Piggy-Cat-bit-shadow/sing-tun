@@ -323,6 +323,13 @@ func (q *OutboundQueue) noteNeedLocked(owner *GoConn, need int64) {
 	if q.needs == nil {
 		q.needs = make(map[int64]int)
 	}
+	if len(q.needs) >= outboundQueueMaxNeeds {
+		// Bound the state: a connection cancelled while blocked never clears its entry, so
+		// a long-lived queue could accumulate one per dead writer. Dropping the map is safe:
+		// a live waiter keeps its interest and blocked group, the notify fallback uses one
+		// byte, and its next refusal re-adds the real size.
+		q.needs = make(map[int64]int)
+	}
 	q.needs[need]++
 	q.needsAccess.Unlock()
 	if owner != nil {
@@ -381,6 +388,9 @@ func (q *OutboundQueue) pushLocked(ring *goPacketRing, packet *buf.Buffer, owner
 	}
 	ring.push(packet, owner, segmentEnd)
 }
+
+// outboundQueueMaxNeeds bounds the per-queue need multiset (see noteNeedLocked).
+const outboundQueueMaxNeeds = 64
 
 // byteBlockedHook is the test seam for the reservation-failure -> interest-publish window:
 // it runs after a byte-budget refusal and before the interest is published, so a test can

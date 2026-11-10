@@ -141,3 +141,54 @@ func TestTheSmallestBlockedFrameIsNotMaskedByALargerOne(t *testing.T) {
 		t.Fatalf("device total %d, want both frames' 4000", got)
 	}
 }
+
+// TestNeedMultisetIsBounded pins the safety net for cancelled writers: a queue that has
+// seen many refused sizes (one per conn) keeps at most outboundQueueMaxNeeds entries, and a
+// live waiter still wakes after the bound was hit.
+func TestNeedMultisetIsBounded(t *testing.T) {
+	device := newCrossQueueDevice(t, 4000)
+	target := parkedQueue(t, device)
+	for index := 0; index < outboundQueueMaxNeeds*2; index++ {
+		conn := &GoConn{}
+		target.access.Lock()
+		target.noteNeedLocked(conn, int64(100+index))
+		target.access.Unlock()
+	}
+	if got := len(target.needs); got > outboundQueueMaxNeeds {
+		t.Fatalf("the need multiset holds %d entries, want at most %d", got, outboundQueueMaxNeeds)
+	}
+	if target.minNeed() <= 0 {
+		t.Fatal("the multiset lost its minimum while waiting")
+	}
+	// A live waiter still gets a group when room appears.
+	target.access.Lock()
+	target.noteNeedLocked(&GoConn{}, 1000)
+	target.access.Unlock()
+	conn := &GoConn{}
+	conn.outboundQueue.Store(target)
+	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
+	if waiters, armErr := io.armTransmitWritable(conn); armErr != nil || waiters == nil {
+		t.Fatalf("the writer was not armed after the bound: (%v, %v)", waiters, armErr)
+	}
+}
+
+// TestCancelClearsTheRecordedNeed pins the queue-level cleanup GoConn.Close performs: a
+// cancelled writer's need leaves the multiset, so the queue's minimum moves on.
+func TestCancelClearsTheRecordedNeed(t *testing.T) {
+	device := newCrossQueueDevice(t, 4000)
+	target := parkedQueue(t, device)
+	conn := &GoConn{}
+	target.access.Lock()
+	target.noteNeedLocked(conn, 1000)
+	target.access.Unlock()
+	if target.minNeed() != 1000 {
+		t.Fatalf("minNeed = %d, want 1000", target.minNeed())
+	}
+	// The same body GoConn.Close calls after marking the connection closed.
+	target.access.Lock()
+	target.clearNeedLocked(conn)
+	target.access.Unlock()
+	if got := target.minNeed(); got != 0 {
+		t.Fatalf("a cancelled writer left its need behind: minNeed = %d", got)
+	}
+}
