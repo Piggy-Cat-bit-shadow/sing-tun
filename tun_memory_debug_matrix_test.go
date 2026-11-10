@@ -34,7 +34,7 @@ func TestFragmentGroupNeedAndRetry(t *testing.T) {
 	if err := target.enqueue(buf.NewSize(1), fragments, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
 		t.Fatalf("fragment group enqueue = %v, want errGoTransmitBlocked", err)
 	}
-	if got := target.minNeed(); got != 3000 {
+	if got := target.minWaitNeed(); got != 3000 {
 		t.Fatalf("the group need is %d, want the fragments' 3000", got)
 	}
 	io := &goMemoryIO{tun: device, blocked: make(map[*OutboundQueue]*goBlockedWriters)}
