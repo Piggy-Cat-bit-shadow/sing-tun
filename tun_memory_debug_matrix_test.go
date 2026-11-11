@@ -78,7 +78,7 @@ func TestRingFullAndByteFullBothArmAndWake(t *testing.T) {
 			device := newCrossQueueDevice(t, testCase.budget)
 			target := parkedQueue(t, device)
 			// Fill the data ring to its capacity (2 x batchSize = 16) with 100-byte frames.
-			for index := 0; index < 16; index++ {
+			for index := range 16 {
 				if err := target.enqueue(buf.NewSize(100), nil, goOutboundData, nil, 0); err != nil {
 					t.Fatalf("fill %d: %v", index, err)
 				}

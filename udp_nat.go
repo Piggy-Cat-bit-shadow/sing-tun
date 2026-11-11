@@ -503,10 +503,7 @@ func reserveCounter(counter *atomic.Int64, limit, n int64) bool {
 func releaseCounter(counter *atomic.Int64, n int64) {
 	for {
 		current := counter.Load()
-		next := current - n
-		if next < 0 {
-			next = 0
-		}
+		next := max(current-n, 0)
 		if counter.CompareAndSwap(current, next) {
 			return
 		}

@@ -26,12 +26,12 @@ func TestIsLoopbackDestinationRejectsNeighboursAndOtherLoopbacks(t *testing.T) {
 	inet4 := []netip.Addr{netip.MustParseAddr("10.7.0.1")}
 	inet6 := []netip.Addr{netip.MustParseAddr("fdfe:7::1")}
 	for _, destination := range []string{
-		"10.7.0.2",   // the address next door
-		"10.7.0.0",   // the network address
-		"10.0.0.1",   // another range
-		"127.0.0.1",  // the device's own loopback, which is not what this feature answers for
-		"fdfe:7::2",  // the IPv6 address next door
-		"0.0.0.0",    // unspecified
+		"10.7.0.2",  // the address next door
+		"10.7.0.0",  // the network address
+		"10.0.0.1",  // another range
+		"127.0.0.1", // the device's own loopback, which is not what this feature answers for
+		"fdfe:7::2", // the IPv6 address next door
+		"0.0.0.0",   // unspecified
 		"255.255.255.255",
 	} {
 		if isLoopbackDestination(netip.MustParseAddr(destination), inet4, inet6) {

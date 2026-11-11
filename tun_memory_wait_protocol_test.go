@@ -271,17 +271,15 @@ func TestWaitRegistrationRacesQueueCloseSafely(t *testing.T) {
 		waitGroup.Add(1)
 		go func(conn *GoConn) {
 			defer waitGroup.Done()
-			for iteration := 0; iteration < 500; iteration++ {
+			for iteration := range 500 {
 				queue.noteWait(conn, int64(100+iteration))
 				queue.dropWait(conn)
 			}
 		}(conn)
 	}
-	waitGroup.Add(1)
-	go func() {
-		defer waitGroup.Done()
+	waitGroup.Go(func() {
 		_ = queue.Close()
-	}()
+	})
 	waitGroup.Wait()
 	for index, conn := range conns {
 		queue.waitAccess.Lock()

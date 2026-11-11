@@ -32,7 +32,7 @@ func queueFourFrames(t *testing.T, device *MemoryTun) {
 	device.attached.Store(true)
 	frame := make([]byte, 1000)
 	frame[0] = 0x45
-	for index := 0; index < 4; index++ {
+	for index := range 4 {
 		accepted, err := device.WritePackets([][]byte{frame})
 		if err != nil || accepted != 1 {
 			t.Fatalf("queue frame %d = (%d, %v)", index, accepted, err)

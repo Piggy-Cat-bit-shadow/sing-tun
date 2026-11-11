@@ -160,9 +160,9 @@ type ForwardDispatcher struct {
 	udpFiltering NATFiltering
 	icmpTimeout  time.Duration
 
-	closed          atomic.Bool
-	portsAccess     sync.Mutex
-	ports           map[Port]*portReturn
+	closed      atomic.Bool
+	portsAccess sync.Mutex
+	ports       map[Port]*portReturn
 	// routedPort is the return path of the one port that serves flows from the local stack. It is
 	// kept apart from ports so ReturnParsed can find it without the ports lock on the engine's path;
 	// every other port's return path stays in ports.

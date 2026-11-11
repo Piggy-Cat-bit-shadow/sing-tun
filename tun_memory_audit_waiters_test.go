@@ -50,7 +50,7 @@ func TestWaitersSurviveManyDistinctSizes(t *testing.T) {
 		t.Fatalf("writer A was not armed: (%v, %v)", waiters, armErr)
 	}
 	// 64 more writers with distinct sizes 2,000..2,063 push the old multiset over its bound.
-	for index := 0; index < 64; index++ {
+	for index := range 64 {
 		conn := &GoConn{}
 		conn.outboundQueue.Store(target)
 		if err := target.enqueue(buf.NewSize(2000+index), nil, goOutboundData, conn, 0); !errors.Is(err, errGoTransmitBlocked) {
@@ -87,7 +87,7 @@ func TestRepeatedRefusalLeavesNoGhostNeed(t *testing.T) {
 	connA := &GoConn{}
 	connA.outboundQueue.Store(target)
 	// The same 1,000-byte writer is refused twice.
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		if err := target.enqueue(buf.NewSize(1000), nil, goOutboundData, connA, 0); !errors.Is(err, errGoTransmitBlocked) {
 			t.Fatalf("attempt %d = %v, want errGoTransmitBlocked", attempt, err)
 		}
@@ -117,7 +117,7 @@ func TestRepeatedRefusalLeavesNoGhostNeed(t *testing.T) {
 	}
 	// No release and no drain: the ghost 1,000-byte need must not deliver a group that
 	// cannot progress. Four arm/take cycles must stay empty.
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := range 4 {
 		_, _ = io.armTransmitWritable(connB)
 		if len(io.takeTransmitWritable(nil)) != 0 {
 			t.Fatalf("attempt %d delivered a group although the 2,000-byte frame cannot fit", attempt)

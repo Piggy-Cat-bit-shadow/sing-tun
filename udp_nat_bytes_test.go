@@ -109,7 +109,7 @@ func TestUDPNatSessionByteCapDropsAndConserves(t *testing.T) {
 
 	const datagram = 4 * 1024
 	const accepted = 4 // 16 KiB cap
-	for index := 0; index < 8; index++ {
+	for range 8 {
 		sendSizedPacket(nat, 41000, "203.0.113.10:443", datagram)
 	}
 	waitForBytes(t, "the handler to start", func() bool { return handler.started.Load() == 1 })
@@ -180,7 +180,7 @@ func TestUDPNatCloseReleasesQueuedBytes(t *testing.T) {
 	droppedBytesBefore := UDPNatDroppedBytes()
 
 	const datagram = 4 * 1024
-	for index := 0; index < 4; index++ {
+	for index := range 4 {
 		sendSizedPacket(nat, uint16(43000+index), "203.0.113.12:443", datagram)
 	}
 	waitForBytes(t, "the queue to fill", func() bool { return nat.QueuedBytes() == 4*datagram })

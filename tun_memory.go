@@ -153,8 +153,7 @@ func (t *MemoryTun) writePackets(packets [][]byte, wait bool) (int, error) {
 		t.inboundAccess.Unlock()
 		return 0, nil
 	}
-	headroom := int(t.inboundHeadroom.Load())
-	rearSpace := int(t.inboundRearSpace.Load())
+	var headroom, rearSpace int
 	accepted := 0
 	notify := false
 	for _, packet := range packets {
@@ -325,10 +324,7 @@ func (t *MemoryTun) releaseQueuedBytesLocked(n int64) {
 	}
 	for {
 		current := t.queuedBytes.Load()
-		next := current - n
-		if next < 0 {
-			next = 0
-		}
+		next := max(current-n, 0)
 		if t.queuedBytes.CompareAndSwap(current, next) {
 			return
 		}

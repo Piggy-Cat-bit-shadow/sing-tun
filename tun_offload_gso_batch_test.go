@@ -81,7 +81,7 @@ func TestGSOSplitResumesAcrossBatches(t *testing.T) {
 		if count > batchSize {
 			t.Fatalf("pass %d from segment %d emitted %d segments into %d buffers", passes, segment, count, batchSize)
 		}
-		for index := 0; index < count; index++ {
+		for index := range count {
 			if sizes[index] != headerLength+segmentSize {
 				t.Fatalf("segment %d has size %d, want %d", segment+index, sizes[index], headerLength+segmentSize)
 			}

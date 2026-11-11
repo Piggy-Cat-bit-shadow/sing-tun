@@ -178,7 +178,7 @@ func TestUDPNatBurstKeepsTheSessionTableBounded(t *testing.T) {
 	// sessions unwind, which is why the audit saw 259 of a 256 bound.
 	var peakTable int
 	var peakHandlers int64
-	for flow := 0; flow < flows; flow++ {
+	for flow := range flows {
 		packetTo(nat, uint16(10000+flow), "203.0.113.1:443")
 		if table := nat.cache.Len(); table > peakTable {
 			peakTable = table
@@ -262,7 +262,7 @@ func TestUDPNatTwoHundredFlowsLeaveNothingBehind(t *testing.T) {
 	handler := &natStressHandler{}
 	nat, _, prepared := newStressNAT(t, 4096, handler)
 
-	for flow := 0; flow < flows; flow++ {
+	for flow := range flows {
 		packetTo(nat, uint16(20000+flow), "203.0.113.2:3478")
 	}
 	if got := int(prepared.Load()); got != flows {
@@ -301,7 +301,7 @@ func TestUDPNatLifetimeReclaimsIdleFlows(t *testing.T) {
 	}
 	defer nat.Close()
 
-	for flow := 0; flow < 8; flow++ {
+	for flow := range 8 {
 		packetTo(nat, uint16(30000+flow), "203.0.113.3:443")
 	}
 	// The handler runs on its own goroutine, so the last flow may not have entered it yet. Wait for

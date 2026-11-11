@@ -62,7 +62,7 @@ func TestMemoryTunOutboundReleaseWakesInboundByteWaiter(t *testing.T) {
 		t.Fatal("the outbound handler never entered")
 	}
 	waitForBytes(t, "the filler to leave the rings", func() bool { return queue.QueuedBytes() == 0 })
-	for index := 0; index < 4; index++ {
+	for index := range 4 {
 		if err := queue.enqueue(buf.NewSize(1000), nil, goOutboundDatagram, nil, 0); err != nil {
 			t.Fatalf("queue enqueue %d: %v", index, err)
 		}

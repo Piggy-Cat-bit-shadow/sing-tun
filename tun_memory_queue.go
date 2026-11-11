@@ -412,6 +412,7 @@ func (q *OutboundQueue) clearWaits() {
 	q.waitTail = nil
 	q.waitAccess.Unlock()
 }
+
 func (q *OutboundQueue) pushLocked(ring *goPacketRing, packet *buf.Buffer, owner *GoConn, segmentEnd uint64) {
 	if owner != nil {
 		owner.frameEnqueued(packet.Len())

@@ -36,10 +36,10 @@ type Go struct {
 	// returnPath is the return path the dispatcher attached when this stack was registered as a
 	// routed port. The dispatcher attaches it once from natFor, so it is nil until a flow is routed
 	// into the stack and nil again after DetachReturn.
-	returnPath atomic.Pointer[Return]
-	directory              goFlowDirectory
-	congestion             *goCongestionOps
-	queueFactory           func(stack *Go) ([]goPlatformIO, error)
+	returnPath   atomic.Pointer[Return]
+	directory    goFlowDirectory
+	congestion   *goCongestionOps
+	queueFactory func(stack *Go) ([]goPlatformIO, error)
 	// access is the publish lock: Start, Close, ResetNetwork and selectEngine take it. It guards
 	// started and every resource Start publishes, so a reader that holds it sees either nothing or a
 	// complete publish.
