@@ -165,11 +165,25 @@ func TestGoKernelSACKReneging(t *testing.T) {
 			if err != nil {
 				test.Fatal(err)
 			}
-			retained := goSackBlock{start: uint64(mss + 1), end: uint64(len(payload) + 1)}
+			var retained goSackBlock
 			traffic.await(test, server, "kernel SACK of queued out-of-order data", func(flow kernelTCPFlow) bool {
-				return slices.ContainsFunc(flow.events, func(event kernelTCPEvent) bool {
-					return !event.outgoing && slices.Contains(event.sacks, retained)
-				})
+				for _, event := range flow.events {
+					if event.outgoing {
+						continue
+					}
+					for _, block := range event.sacks {
+						// Wait for the kernel to SACK everything sent so far. The
+						// advertised receive window decides how much of the payload
+						// leaves the sender before the first segment is retransmitted,
+						// and it is not always all eight segments; the SACK interval
+						// under test is the one the kernel actually reported.
+						if block.start == uint64(mss+1) && block.end == flow.sent && block.end > block.start {
+							retained = block
+							return true
+						}
+					}
+				}
+				return false
 			})
 			err = client.SetReadBuffer(512)
 			if err != nil {
