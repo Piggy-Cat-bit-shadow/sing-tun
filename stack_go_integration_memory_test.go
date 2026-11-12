@@ -119,14 +119,18 @@ func TestGoMemoryDial(t *testing.T) {
 					prefix = netip.MustParsePrefix("fd73:ab91:ffff::/48")
 					destination = netip.MustParseAddrPort("[fd73:ab91:ffff::254]:9")
 				}
-				if !kernelAddUnreachableRoute(test, prefix) {
+				if !kernelAddUnreachableRoute(test, fixture.options.Name, prefix) {
 					test.Skip("unreachable routes are not configurable on this platform")
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
+				started := time.Now()
 				_, err := fixture.stack.DialTCP(ctx, fixture.kernelAddress(ipv6).Next(), destination)
 				if !E.IsMulti(err, syscall.EHOSTUNREACH, syscall.ENETUNREACH) {
 					test.Fatalf("dial to an unroutable address returned %v", err)
+				}
+				if elapsed := time.Since(started); elapsed > time.Second {
+					test.Fatalf("unreachable address failed after %v, the dial timed out instead", elapsed)
 				}
 			})
 			addressTest.Run("cancel", func(test *testing.T) {

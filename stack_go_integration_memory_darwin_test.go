@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func kernelAddUnreachableRoute(t *testing.T, prefix netip.Prefix) bool {
+func kernelAddUnreachableRoute(_ *testing.T, _ string, _ netip.Prefix) bool {
 	return false
 }
 
