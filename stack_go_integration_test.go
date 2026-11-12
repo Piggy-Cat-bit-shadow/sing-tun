@@ -759,14 +759,21 @@ func TestGoKernelSequenceWrap(t *testing.T) {
 	for _, ipv6 := range []bool{false, true} {
 		for _, mode := range []string{"write", "buffer", "splice"} {
 			t.Run(fmt.Sprintf("ipv6=%v/mode=%s", ipv6, mode), func(test *testing.T) {
-				test.Parallel()
+				// Run the cases one at a time. Each case moves 4 GiB in both
+				// directions; under the race detector six parallel cases need more
+				// aggregate throughput than four Ps can deliver, so the per-case
+				// deadline would fail before a wrap bug could show. Sequentially each
+				// case keeps the whole GOMAXPROCS budget and finishes in 24-31 s
+				// alone, or up to about a minute with the rest of the suite on a
+				// loaded host, so two minutes keeps the liveness bound instead of
+				// making the case a machine-speed gate.
 				var client, server net.Conn
 				if mode == "splice" {
 					client, server, _, _ = fixture.splicePair(test, ipv6)
 				} else {
 					client, server = fixture.pair(test, ipv6)
 				}
-				deadline := time.Now().Add(60 * time.Second)
+				deadline := time.Now().Add(2 * time.Minute)
 				client.SetDeadline(deadline)
 				server.SetDeadline(deadline)
 				completed := make(chan error, 1)
