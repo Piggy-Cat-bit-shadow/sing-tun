@@ -64,7 +64,7 @@ func TestGoPacketConnSnapshotReleasedOnEveryEnding(t *testing.T) {
 // snapshot lock is what keeps the clear from being lost; run under -race this also proves no data
 // race on the slice field.
 func TestGoPacketConnSnapshotCloseRacesHandshake(t *testing.T) {
-	for iteration := 0; iteration < 100; iteration++ {
+	for range 100 {
 		conn := &GoPacketConn{
 			engine:   &goEngine{stack: &Go{}},
 			snapshot: []byte{0x45, 0, 0, 20},
