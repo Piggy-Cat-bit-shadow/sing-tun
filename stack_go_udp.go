@@ -486,6 +486,12 @@ func (w *GoPacketConn) closeSplice(err error) {
 }
 
 func (w *GoPacketConn) Close() error {
+	// The first datagram is a heap slice retained for a possible ICMP reply. HandshakeSuccess and
+	// HandshakeFailure already drop it; Close must too, otherwise a flow closed before either
+	// callback keeps the slice reachable for as long as the conn object itself is referenced.
+	w.snapshotAccess.Lock()
+	w.snapshot = nil
+	w.snapshotAccess.Unlock()
 	directory := &w.engine.stack.directory
 	if directory.udpFlows != nil {
 		directory.access.Lock()
