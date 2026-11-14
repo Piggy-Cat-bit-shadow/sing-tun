@@ -66,10 +66,10 @@ func (h *nfqueueHandler) acceptVerdict(packet preMatchPacket) (verdict int, mark
 func (h *nfqueueHandler) setVerdict(queued queuedPacket, verdict int, mark uint32) {
 	var err error
 	if mark != 0 {
-		if h.markMask != 0 {
-			mark = queued.mark&^h.markMask | mark
-		}
-		err = h.nfq.SetVerdictWithOption(queued.id, verdict, nfqueue.WithMark(mark))
+		// Every bit outside our own mask belongs to another program - a routing mark, a policy
+		// routing rule, netd's VPN bits - and the verdict replaces the whole packet mark, so
+		// they have to be carried over here rather than dropped.
+		err = h.nfq.SetVerdictWithOption(queued.id, verdict, nfqueue.WithMark(queued.mark&^h.markMask|mark))
 	} else {
 		err = h.nfq.SetVerdict(queued.id, verdict)
 	}

@@ -108,6 +108,7 @@ type forwardFlow struct {
 	finReverse  atomic.Bool
 	reported    atomic.Bool
 	closed      atomic.Bool
+	aborted     atomic.Bool
 	lastReverse atomic.Int64
 }
 
@@ -128,6 +129,7 @@ func (f *forwardFlow) close(reason FlowCloseReason) {
 }
 
 func (f *forwardFlow) CloseFlow() {
+	f.aborted.Store(true)
 	f.close(FlowCloseReset)
 }
 
@@ -1030,6 +1032,11 @@ func (s *ForwardStage) sweepDue() (time.Duration, bool) {
 }
 
 func entryExpired(entry *flowEntry, now int64) bool {
+	// An aborted flow holds no state worth keeping: its connection was closed by the caller, so
+	// the next packet on the same four-tuple has to reach the classifier instead of the entry.
+	if entry.flow != nil && entry.flow.aborted.Load() {
+		return true
+	}
 	if now <= entry.deadline {
 		return false
 	}
@@ -1096,10 +1103,10 @@ func (s *ForwardStage) evictEntries(now int64) {
 func (s *ForwardStage) sweep(now int64) {
 	visited := 0
 	for key, entry := range s.table {
-		if entry.action == ActionFlow && entry.flow.closed.Load() {
-			tombstoneEntry(entry, now)
-		} else if entryExpired(entry, now) {
+		if entryExpired(entry, now) {
 			s.removeEntry(key, entry, FlowCloseTimeout)
+		} else if entry.action == ActionFlow && entry.flow.closed.Load() {
+			tombstoneEntry(entry, now)
 		}
 		visited++
 		if visited >= flowSweepLimit {

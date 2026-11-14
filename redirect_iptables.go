@@ -541,7 +541,7 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 	if family.isIPv6 && !family.tproxy {
 		preroutingMarkChain.add("-p", "tcp", "-m", "mark", "--mark", resetMark, "-j", "RETURN")
 	}
-	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-j", "MARK", "--set-xmark", inputMark)
+	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-m", "conntrack", "--ctdir", "ORIGINAL", "-j", "MARK", "--set-xmark", inputMark)
 	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-j", "RETURN")
 	preroutingMarkChain.add("-m", "connmark", "--mark", outputMark, "-j", "MARK", "--set-xmark", outputMark)
 	preroutingMarkChain.add("-m", "connmark", "--mark", outputMark, "-j", "RETURN")
@@ -602,9 +602,12 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 		}
 		inserts = append(inserts, iptablesInsert{iptablesTableNAT, "PREROUTING", []string{"-j", preroutingNAT.name}})
 		if r.androidVPNService {
+			// Qualcomm QoS chains in mangle POSTROUTING (qcom_qos_reset_POSTROUTING)
+			// overwrite the whole packet mark on rmnet egress, so the postrouting
+			// rules match the connmark.
 			postroutingNAT := r.iptablesChain(family, iptablesTableNAT, r.tableName+"-postrouting")
 			for _, prefix := range options.Inet4Address {
-				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "mark", "--mark", outputMark, "-j", "MASQUERADE")
+				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "connmark", "--mark", outputMark, "-j", "MASQUERADE")
 			}
 			if postroutingNAT.err != nil {
 				return postroutingNAT.err
@@ -612,7 +615,7 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 			inserts = append(inserts, iptablesInsert{iptablesTableNAT, "POSTROUTING", []string{"-j", postroutingNAT.name}})
 			postroutingMangle := r.iptablesChain(family, iptablesTableMangle, r.tableName+"-postrouting")
 			for _, prefix := range options.Inet4Address {
-				postroutingMangle.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "mark", "--mark", outputMark, "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+				postroutingMangle.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "connmark", "--mark", outputMark, "-j", "TCPMSS", "--clamp-mss-to-pmtu")
 			}
 			if postroutingMangle.err != nil {
 				return postroutingMangle.err
@@ -742,8 +745,10 @@ func (r *autoRedirect) setupIPTablesUnreachable() error {
 	}
 	path, err := findIPTablesBinary(r.enableIPv4)
 	if err != nil {
-		r.logger.Warn("strict route is not available for the disabled address family: ", err)
-		return nil
+		// Strict route exists to keep the disabled family unreachable. Skipping the rules here
+		// would leave that family routed past the tunnel, which is the leak this option is set to
+		// prevent, so the redirect fails to start instead of starting without the guarantee.
+		return E.Cause(err, "strict route is not available for the disabled address family")
 	}
 	family := &iptablesFamily{path: path, isIPv6: r.enableIPv4}
 	outputName := r.tableName + "-unreachable-output"

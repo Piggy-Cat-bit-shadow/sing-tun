@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1194,6 +1195,7 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 }
 
 func (t *NativeTun) setRules() error {
+	var uidRangeChecked bool
 	for i, rule := range t.rules() {
 		err := netlink.RuleAdd(rule)
 		if err != nil {
@@ -1206,6 +1208,18 @@ func (t *NativeTun) setRules() error {
 				}
 			}
 			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+		}
+		// A kernel before Linux 4.10 accepts a rule carrying a uid range and silently drops the
+		// range, which would send the excluded user's traffic through the tunnel instead of
+		// letting the rule skip it. Read the rule back and refuse to run on such a kernel.
+		if rule.UIDRange != nil && !uidRangeChecked {
+			uidRangeChecked = true
+			installedRules, listErr := netlink.RuleListFiltered(rule.Family, &netlink.Rule{Priority: rule.Priority}, netlink.RT_FILTER_PRIORITY)
+			if listErr == nil && !slices.ContainsFunc(installedRules, func(it netlink.Rule) bool {
+				return it.UIDRange != nil
+			}) {
+				return E.New("uid range rules are not supported by the kernel (Linux 4.10 or later is required)")
+			}
 		}
 	}
 	return nil
