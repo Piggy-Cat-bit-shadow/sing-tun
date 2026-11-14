@@ -188,6 +188,98 @@ func TestTCPDispatcherPerDispatchCost(t *testing.T) {
 	})
 }
 
+type memorySample struct {
+	heapAlloc   uint64
+	heapObjects uint64
+	stackInuse  uint64
+	goroutines  int
+}
+
+func readMemorySample() memorySample {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return memorySample{
+		heapAlloc:   stats.HeapAlloc,
+		heapObjects: stats.HeapObjects,
+		stackInuse:  stats.StackInuse,
+		goroutines:  runtime.NumGoroutine(),
+	}
+}
+
+// TestUDPNatFlowCostAtScale extends the per-flow measurement to the burst sizes the device profile
+// uses, and separates the three questions the earlier tests could not answer together:
+//
+//  1. burst creation: what does the process hold the moment N entries exist?
+//  2. stable hold: what remains after a GC (HeapAlloc/HeapObjects/StackInuse are different views)?
+//     3.集中释放: after every conn is closed, do entries, queued bytes and dispatcher goroutines return
+//     to the baseline, or is something retained?
+//
+// Host Go runtime only. The numbers characterize growth and recovery; they are not iOS phys_footprint
+// and must not be used to justify an ingress gate on their own.
+func TestUDPNatFlowCostAtScale(t *testing.T) {
+	for _, flows := range []int{2000, 4096} {
+		handler := &blockingUDPHandler{release: make(chan struct{})}
+		nat := newStatsNAT(t, handler, 4096)
+
+		runtime.GC()
+		baseline := readMemorySample()
+
+		for index := 0; index < flows; index++ {
+			sendSizedPacket(nat, uint16(4000+index), "203.0.113.1:53", 1200)
+		}
+		requireEventually(t, "NAT entries", func() bool { return nat.Stats().Entries == flows })
+		burst := readMemorySample()
+		burstStats := nat.Stats()
+
+		// Stable hold: nothing is created or released; a GC separates live retention from floating
+		// garbage. HeapAlloc after GC is the live figure; HeapObjects counts the same live objects.
+		runtime.GC()
+		stable := readMemorySample()
+		stableStats := nat.Stats()
+		t.Logf("flows=%d BURST entries=%d sessions=%d queued=%d goroutines=%d heap=%d objects=%d stack=%d | STABLE(after GC) heap=%d objects=%d stack=%d goroutines=%d entries=%d queued=%d",
+			flows, burstStats.Entries, burstStats.SessionsCreated, burstStats.QueuedBytes,
+			burst.goroutines, burst.heapAlloc, burst.heapObjects, burst.stackInuse,
+			stable.heapAlloc, stable.heapObjects, stable.stackInuse, stable.goroutines,
+			stableStats.Entries, stableStats.QueuedBytes)
+
+		// Concentrated release: every handler is released and the NAT is closed without per-flow
+		// pacing, which is the shape a network teardown produces.
+		close(handler.release)
+		if err := nat.Close(); err != nil {
+			t.Fatalf("flows=%d: close NAT: %v", flows, err)
+		}
+		requireEventually(t, "NAT entries drained", func() bool { return nat.Stats().Entries == 0 })
+		requireEventually(t, "queued bytes drained", func() bool { return nat.Stats().QueuedBytes == 0 })
+		requireEventually(t, "dispatcher goroutines", func() bool {
+			return runtime.NumGoroutine() <= baseline.goroutines+10
+		})
+
+		// One GC may leave runtime caches (mcache spans, heap arenas) in HeapAlloc; sample after the
+		// first and after two more collections so "live objects fell" is distinguishable from "the
+		// allocator has not returned pages yet".
+		runtime.GC()
+		recovered := readMemorySample()
+		runtime.GC()
+		runtime.GC()
+		settled := readMemorySample()
+		recoveredStats := nat.Stats()
+		var settledMem runtime.MemStats
+		runtime.ReadMemStats(&settledMem)
+		t.Logf("flows=%d RECOVERED entries=%d queued=%d goroutines=%d (baseline %d) after1GC heap=%d objects=%d stack=%d | after3GC heap=%d objects=%d stack=%d heapInuse=%d heapReleased=%d",
+			flows, recoveredStats.Entries, recoveredStats.QueuedBytes, settled.goroutines, baseline.goroutines,
+			recovered.heapAlloc, recovered.heapObjects, recovered.stackInuse,
+			settled.heapAlloc, settled.heapObjects, settled.stackInuse, settledMem.HeapInuse, settledMem.HeapReleased)
+
+		if recoveredStats.Entries != 0 || recoveredStats.QueuedBytes != 0 {
+			t.Fatalf("flows=%d: NAT retained entries=%d queued=%d after close", flows, recoveredStats.Entries, recoveredStats.QueuedBytes)
+		}
+		if settled.heapObjects >= stable.heapObjects/2 {
+			t.Fatalf("flows=%d: live objects did not fall after release: stable=%d settled=%d",
+				flows, stable.heapObjects, settled.heapObjects)
+		}
+	}
+}
+
 func requireEventually(t *testing.T, what string, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
