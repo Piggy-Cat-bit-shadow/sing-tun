@@ -150,10 +150,12 @@ func (s *RedirectServer) loopIn() {
 		}
 		s.connections[conn] = struct{}{}
 		s.access.Unlock()
-		go s.handler.NewConnectionEx(s.ctx, conn, source, destination, func(error) {
-			s.access.Lock()
-			delete(s.connections, conn)
-			s.access.Unlock()
+		goDispatch(func() {
+			s.handler.NewConnectionEx(s.ctx, conn, source, destination, func(error) {
+				s.access.Lock()
+				delete(s.connections, conn)
+				s.access.Unlock()
+			})
 		})
 	}
 }

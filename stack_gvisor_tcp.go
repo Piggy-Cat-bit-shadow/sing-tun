@@ -100,5 +100,7 @@ func (f *TCPForwarder) Forward(r *tcp.ForwarderRequest) {
 		localAddr:  source.TCPAddr(),
 		remoteAddr: destination.TCPAddr(),
 	}
-	go f.handler.NewConnectionEx(f.ctx, conn, source, destination, nil)
+	goDispatch(func() {
+		f.handler.NewConnectionEx(f.ctx, conn, source, destination, nil)
+	})
 }

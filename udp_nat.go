@@ -125,7 +125,9 @@ type UDPNat struct {
 	// packet path.
 	maxQueuedBytes     int64
 	maxBytesPerSession int
+	maxSize            int
 	queuedBytes        atomic.Int64
+	sessionsCreated    atomic.Uint64
 	state              atomic.Uint32
 	lifecycleAccess    sync.Mutex
 	closeOnce          sync.Once
@@ -169,6 +171,7 @@ func NewUDPNat(options UDPNatOptions) *UDPNat {
 		maxQueuedBytes = DefaultUDPNatMaxBytes
 	}
 	service.maxQueuedBytes = int64(maxQueuedBytes)
+	service.maxSize = int(maxSize)
 	service.maxBytesPerSession = options.MaxBytesPerSession
 	if service.maxBytesPerSession <= 0 {
 		service.maxBytesPerSession = DefaultUDPNatMaxBytesPerSession
@@ -431,6 +434,7 @@ func (s *UDPNat) getOrCreate(key udpNatSessionKey, source M.Socksaddr, destinati
 		}
 		newContext = ctx
 		newOnClose = onClose
+		s.sessionsCreated.Add(1)
 		return newConn, true
 	})
 	if !ok {

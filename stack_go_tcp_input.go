@@ -168,7 +168,9 @@ func (e *goEngine) handleTCPSyn(parsed *forwardPacket) {
 		e.handleEngage(conn)
 		return
 	}
-	go e.stack.handler.NewConnectionEx(e.stack.ctx, conn, source, destination, nil)
+	goDispatch(func() {
+		e.stack.handler.NewConnectionEx(e.stack.ctx, conn, source, destination, nil)
+	})
 }
 
 func (e *goEngine) initializeSession(conn *GoConn, now int64, peerWindow uint16) {

@@ -576,7 +576,9 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat, network strin
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
 		}
-		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
+		goDispatch(func() {
+			s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
+		})
 	}
 }
 
