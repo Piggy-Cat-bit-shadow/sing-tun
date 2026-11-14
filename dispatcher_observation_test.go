@@ -104,11 +104,22 @@ func TestUDPNatPerFlowCost(t *testing.T) {
 		runtime.ReadMemStats(&loaded)
 		stats := nat.Stats()
 		goroutines := runtime.NumGoroutine() - baseGoroutines
-		perFlowHeap := (loaded.HeapAlloc - baseline.HeapAlloc) / uint64(flows)
+		heapDelta := int64(loaded.HeapAlloc) - int64(baseline.HeapAlloc)
+		stackDelta := int64(loaded.StackInuse) - int64(baseline.StackInuse)
+		// The queued datagrams are heap allocations; they are a SUBSET of heapDelta, not an
+		// additional cost on top of it. Subtracting them leaves the structural per-entry cost.
+		structural := heapDelta - stats.QueuedBytes
+		if structural < 0 {
+			structural = 0
+		}
+		perFlowHeap := heapDelta / int64(flows)
+		perFlowStructural := structural / int64(flows)
+		perFlowStack := stackDelta / int64(flows)
+		perFlowQueued := stats.QueuedBytes / int64(flows)
 
-		t.Logf("udp flows=%d entries=%d sessions=%d queued=%d goroutines+%d heap=%d B/flows=%d B/flow",
+		t.Logf("udp flows=%d entries=%d sessions=%d queued=%d goroutines+%d heap=%d B (%d B/flow, includes queued) structural=%d B/structure=%d B/flow stack=%d B (%d B/flow) queued=%d B/flow",
 			flows, stats.Entries, stats.SessionsCreated, stats.QueuedBytes, goroutines,
-			loaded.HeapAlloc-baseline.HeapAlloc, perFlowHeap)
+			heapDelta, perFlowHeap, structural, perFlowStructural, stackDelta, perFlowStack, perFlowQueued)
 
 		if stats.Entries != flows || stats.SessionsCreated != uint64(flows) {
 			t.Fatalf("flows=%d: entries=%d sessions=%d", flows, stats.Entries, stats.SessionsCreated)
@@ -116,8 +127,11 @@ func TestUDPNatPerFlowCost(t *testing.T) {
 		if goroutines < flows || goroutines > flows*2 {
 			t.Fatalf("flows=%d: goroutines grew by %d; one dispatcher goroutine per flow is the expected shape", flows, goroutines)
 		}
-		if perFlowHeap == 0 {
-			t.Fatalf("flows=%d: no measurable per-flow heap", flows)
+		if structural <= 0 {
+			t.Fatalf("flows=%d: no measurable structural heap after subtracting the queued datagrams", flows)
+		}
+		if stackDelta <= 0 {
+			t.Fatalf("flows=%d: StackInuse did not grow with %d parked goroutines", flows, goroutines)
 		}
 
 		close(handler.release)
@@ -154,17 +168,12 @@ func TestTCPDispatcherPerDispatchCost(t *testing.T) {
 	runtime.ReadMemStats(&loaded)
 	after := TCPDispatcherStats()
 	goroutines := runtime.NumGoroutine() - baseGoroutines
-	// A GC can leave HeapAlloc below the baseline; report the signed delta and only derive a
-	// per-dispatch figure when it is positive. The dispatcher cost claim in the report rests on the
-	// goroutine count, which is stable here.
-	heapDelta := int64(loaded.HeapAlloc) - int64(baseline.HeapAlloc)
-	perDispatchHeap := int64(0)
-	if heapDelta > 0 {
-		perDispatchHeap = heapDelta / int64(dispatches)
-	}
-	t.Logf("tcp dispatches=%d active=%d goroutines+%d heapDelta=%d B/%d B/dispatch",
-		after.TCPAccepted-before.TCPAccepted, after.TCPActive, goroutines,
-		heapDelta, perDispatchHeap)
+	// This test measures the DISPATCHER overhead (one goroutine per handler call), not the TCP
+	// state machine's memory or a physical socket. Heap is not attributed per dispatch: a GC can
+	// move it either way, and the handler in this test is an empty closure, so a per-dispatch heap
+	// number would describe the test, not the dispatcher.
+	t.Logf("tcp dispatches=%d active=%d goroutines+%d (dispatcher goroutines only; no per-dispatch heap claim)",
+		after.TCPAccepted-before.TCPAccepted, after.TCPActive, goroutines)
 
 	if after.TCPAccepted-before.TCPAccepted != dispatches {
 		t.Fatalf("accepted delta = %d, want %d", after.TCPAccepted-before.TCPAccepted, dispatches)
