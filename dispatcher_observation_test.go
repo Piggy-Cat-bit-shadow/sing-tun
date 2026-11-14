@@ -52,7 +52,7 @@ func TestUDPNatStatsReportLogicalFlows(t *testing.T) {
 	nat := newStatsNAT(t, handler, 4096)
 
 	const flows = 64
-	for index := 0; index < flows; index++ {
+	for index := range flows {
 		sendSizedPacket(nat, uint16(2000+index), "203.0.113.1:53", 1200)
 	}
 	requireEventually(t, "NAT entries", func() bool { return nat.Stats().Entries == flows })
@@ -94,7 +94,7 @@ func TestUDPNatPerFlowCost(t *testing.T) {
 		runtime.ReadMemStats(&baseline)
 		baseGoroutines := runtime.NumGoroutine()
 
-		for index := 0; index < flows; index++ {
+		for index := range flows {
 			sendSizedPacket(nat, uint16(3000+index), "203.0.113.1:53", 1200)
 		}
 		requireEventually(t, "NAT entries", func() bool { return nat.Stats().Entries == flows })
@@ -109,9 +109,7 @@ func TestUDPNatPerFlowCost(t *testing.T) {
 		// The queued datagrams are heap allocations; they are a SUBSET of heapDelta, not an
 		// additional cost on top of it. Subtracting them leaves the structural per-entry cost.
 		structural := heapDelta - stats.QueuedBytes
-		if structural < 0 {
-			structural = 0
-		}
+		structural = max(structural, 0)
 		perFlowHeap := heapDelta / int64(flows)
 		perFlowStructural := structural / int64(flows)
 		perFlowStack := stackDelta / int64(flows)
@@ -156,7 +154,7 @@ func TestTCPDispatcherPerDispatchCost(t *testing.T) {
 
 	const dispatches = 1000
 	release := make(chan struct{})
-	for index := 0; index < dispatches; index++ {
+	for range dispatches {
 		goDispatch(func() { <-release })
 	}
 	requireEventually(t, "active dispatches", func() bool {
@@ -224,7 +222,7 @@ func TestUDPNatFlowCostAtScale(t *testing.T) {
 		runtime.GC()
 		baseline := readMemorySample()
 
-		for index := 0; index < flows; index++ {
+		for index := range flows {
 			sendSizedPacket(nat, uint16(4000+index), "203.0.113.1:53", 1200)
 		}
 		requireEventually(t, "NAT entries", func() bool { return nat.Stats().Entries == flows })
