@@ -1,7 +1,6 @@
 package tun
 
 import (
-	"slices"
 	"sync"
 
 	"github.com/sagernet/sing-tun/internal/winipcfg"
@@ -211,10 +210,8 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	if err != nil {
 		return E.Cause(err, "read DNS servers: ", alias)
 	}
-	oldInterface := m.defaultInterface.Swap(newInterface)
-	oldDNSServers := m.defaultDNSServers
-	m.defaultDNSServers = dnsServers
-	if !defaultInterfaceChanged(oldInterface, newInterface) && slices.Equal(oldDNSServers, dnsServers) {
+	changed, ok := m.publishDefaultInterface(newInterface, dnsServers)
+	if !ok || !changed {
 		return nil
 	}
 	m.emit(newInterface, 0)

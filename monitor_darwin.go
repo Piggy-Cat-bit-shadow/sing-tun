@@ -4,7 +4,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"slices"
 	"sync"
 	"time"
 
@@ -186,10 +185,8 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	if dnsConfiguration != nil {
 		dnsServers = common.Map(dnsConfiguration.Select(newInterface.Index).Servers, netip.AddrPort.Addr)
 	}
-	oldInterface := m.defaultInterface.Swap(newInterface)
-	oldDNSServers := m.defaultDNSServers
-	m.defaultDNSServers = dnsServers
-	if !defaultInterfaceChanged(oldInterface, newInterface) && slices.Equal(oldDNSServers, dnsServers) {
+	changed, ok := m.publishDefaultInterface(newInterface, dnsServers)
+	if !ok || !changed {
 		return nil
 	}
 	m.emit(newInterface, 0)

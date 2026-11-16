@@ -111,16 +111,15 @@ func (m *defaultInterfaceMonitor) postCheckUpdate() {
 	}
 	err = m.checkUpdate()
 	if errors.Is(err, ErrNoRoute) {
-		if !m.noRoute.Load() {
-			m.noRoute.Store(true)
-			m.defaultInterface.Store(nil)
+		changed, ok := m.publishNoRoute()
+		if ok && changed {
 			m.emit(nil, 0)
 		}
 	} else if err != nil {
 		m.logger.Error("check interface: ", err)
 		m.delayCheckUpdate()
 	} else {
-		m.noRoute.Store(false)
+		m.clearNoRoute()
 	}
 }
 
@@ -164,8 +163,52 @@ func (m *defaultInterfaceMonitor) UnregisterCallback(element *list.Element[Defau
 	m.callbacks.Remove(element)
 }
 
+// publishDefaultInterface publishes an interface update only while the monitor
+// is open. The check and the write share the access lock, so a Close that lands
+// during a slow interface refresh cannot be overwritten by the update that
+// started before it. changed reports whether the published state differs from
+// the previous one; ok is false when the monitor has been closed.
+func (m *defaultInterfaceMonitor) publishDefaultInterface(newInterface *control.Interface, dnsServers []netip.Addr) (changed bool, ok bool) {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return false, false
+	}
+	oldInterface := m.defaultInterface.Swap(newInterface)
+	oldDNSServers := m.defaultDNSServers
+	m.defaultDNSServers = dnsServers
+	return defaultInterfaceChanged(oldInterface, newInterface) || !slices.Equal(oldDNSServers, dnsServers), true
+}
+
+func (m *defaultInterfaceMonitor) publishNoRoute() (changed bool, ok bool) {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return false, false
+	}
+	if m.noRoute.Load() {
+		return false, true
+	}
+	m.noRoute.Store(true)
+	m.defaultInterface.Store(nil)
+	return true, true
+}
+
+func (m *defaultInterfaceMonitor) clearNoRoute() {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.closed {
+		return
+	}
+	m.noRoute.Store(false)
+}
+
 func (m *defaultInterfaceMonitor) emit(defaultInterface *control.Interface, flags int) {
 	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		return
+	}
 	callbacks := m.callbacks.Array()
 	m.access.Unlock()
 	for _, callback := range callbacks {

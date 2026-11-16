@@ -84,6 +84,74 @@ func TestDefaultInterfaceMonitorCloseStopsPendingUpdate(t *testing.T) {
 	}
 }
 
+// TestDefaultInterfaceMonitorCloseRefusesLateEmit pins the other half of the
+// Close fence: a postCheckUpdate that is already past its entry check must not
+// deliver an interface to callbacks after Close.
+func TestDefaultInterfaceMonitorCloseRefusesLateEmit(t *testing.T) {
+	monitor, err := NewDefaultInterfaceMonitor(closeTestNetworkMonitor{}, logger.NOP(), DefaultInterfaceMonitorOptions{
+		InterfaceFinder: &closeTestInterfaceFinder{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.(*defaultInterfaceMonitor)
+	var delivered atomic.Int64
+	m.RegisterCallback(func(*control.Interface, int) {
+		delivered.Add(1)
+	})
+	if err = m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.emit(&control.Interface{Index: 1, Name: "late"}, 0)
+	if got := delivered.Load(); got != 0 {
+		t.Fatalf("closed monitor delivered %d callback(s)", got)
+	}
+}
+
+// TestDefaultInterfaceMonitorCloseRefusesLatePublish pins the publish half:
+// a refresh that computes an interface before Close must not write it after
+// Close, even though it is past postCheckUpdate's entry check.
+func TestDefaultInterfaceMonitorCloseRefusesLatePublish(t *testing.T) {
+	monitor, err := NewDefaultInterfaceMonitor(closeTestNetworkMonitor{}, logger.NOP(), DefaultInterfaceMonitorOptions{
+		InterfaceFinder: &closeTestInterfaceFinder{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.(*defaultInterfaceMonitor)
+	if err = m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.publishDefaultInterface(&control.Interface{Index: 1, Name: "late"}, nil); ok {
+		t.Fatal("publishDefaultInterface succeeded after Close")
+	}
+	if got := m.DefaultInterface(); got != nil {
+		t.Fatalf("closed monitor published %v", got)
+	}
+}
+
+// TestDefaultInterfaceMonitorCloseRefusesLateNoRoute pins the no-route half:
+// the ErrNoRoute branch must not clear the interface or announce no-route
+// after Close.
+func TestDefaultInterfaceMonitorCloseRefusesLateNoRoute(t *testing.T) {
+	monitor, err := NewDefaultInterfaceMonitor(closeTestNetworkMonitor{}, logger.NOP(), DefaultInterfaceMonitorOptions{
+		InterfaceFinder: &closeTestInterfaceFinder{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.(*defaultInterfaceMonitor)
+	if err = m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.publishNoRoute(); ok {
+		t.Fatal("publishNoRoute succeeded after Close")
+	}
+	if m.noRoute.Load() {
+		t.Fatal("closed monitor announced no-route")
+	}
+}
+
 // TestDefaultInterfaceMonitorStartAfterClose pins that a closed monitor cannot
 // be revived; a Start that loses the race must unregister itself and report the
 // closed state instead of reinstalling the callback.
