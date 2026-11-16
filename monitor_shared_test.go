@@ -72,8 +72,19 @@ func TestDefaultInterfaceMonitorCloseStopsPendingUpdate(t *testing.T) {
 	if err = monitor.Start(); err != nil {
 		t.Fatal(err)
 	}
+	m := monitor.(*defaultInterfaceMonitor)
+	timer := m.checkUpdateTimer
+	if timer == nil {
+		t.Fatal("precondition: Start did not schedule the coalesced update timer")
+	}
 	if err = monitor.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if m.checkUpdateTimer != nil {
+		t.Fatal("Close left the coalesced update timer installed")
+	}
+	if timer.Stop() {
+		t.Fatal("Close cleared the timer field without stopping the timer")
 	}
 
 	afterClose := finder.updateCalls.Load()
