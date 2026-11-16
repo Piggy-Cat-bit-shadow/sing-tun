@@ -5,6 +5,7 @@ package tun
 import (
 	"errors"
 	"net/netip"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,7 @@ type defaultInterfaceMonitor struct {
 	logger                logger.Logger
 	checkAccess           sync.Mutex
 	checkUpdateTimer      *time.Timer
+	closed                bool
 	element               *list.Element[NetworkUpdateCallback]
 	access                sync.Mutex
 	callbacks             list.List[DefaultInterfaceUpdateCallback]
@@ -66,7 +68,15 @@ func NewDefaultInterfaceMonitor(networkMonitor NetworkUpdateMonitor, logger logg
 }
 
 func (m *defaultInterfaceMonitor) Start() error {
-	m.element = m.networkMonitor.RegisterCallback(m.delayCheckUpdate)
+	element := m.networkMonitor.RegisterCallback(m.delayCheckUpdate)
+	m.access.Lock()
+	if m.closed {
+		m.access.Unlock()
+		m.networkMonitor.UnregisterCallback(element)
+		return os.ErrClosed
+	}
+	m.element = element
+	m.access.Unlock()
 	m.postCheckUpdate()
 	return nil
 }
@@ -74,6 +84,9 @@ func (m *defaultInterfaceMonitor) Start() error {
 func (m *defaultInterfaceMonitor) delayCheckUpdate() {
 	m.access.Lock()
 	defer m.access.Unlock()
+	if m.closed {
+		return
+	}
 	if m.checkUpdateTimer == nil {
 		m.checkUpdateTimer = time.AfterFunc(time.Second, m.postCheckUpdate)
 	} else {
@@ -82,6 +95,12 @@ func (m *defaultInterfaceMonitor) delayCheckUpdate() {
 }
 
 func (m *defaultInterfaceMonitor) postCheckUpdate() {
+	m.access.Lock()
+	closed := m.closed
+	m.access.Unlock()
+	if closed {
+		return
+	}
 	m.checkAccess.Lock()
 	defer m.checkAccess.Unlock()
 	err := m.interfaceFinder.Update()
@@ -106,8 +125,17 @@ func (m *defaultInterfaceMonitor) postCheckUpdate() {
 }
 
 func (m *defaultInterfaceMonitor) Close() error {
-	if m.element != nil {
-		m.networkMonitor.UnregisterCallback(m.element)
+	m.access.Lock()
+	m.closed = true
+	if m.checkUpdateTimer != nil {
+		m.checkUpdateTimer.Stop()
+		m.checkUpdateTimer = nil
+	}
+	element := m.element
+	m.element = nil
+	m.access.Unlock()
+	if element != nil {
+		m.networkMonitor.UnregisterCallback(element)
 	}
 	return nil
 }
