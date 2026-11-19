@@ -24,4 +24,4 @@ jobs:
       - name: Build test binary
         run: go test -c -vet=off -o /tmp/tun-linux.test .
       - name: Real dual-TUN rule/route lifecycle (root)
-        run: sudo /tmp/tun-linux.test -test.run '^TestPrivilegedDualTunIPv6RuleAndRouteLifecycle$|^TestNetworkUpdateMonitorRecoversAfterTheSubscriptionDies$' -test.v -test.timeout 90s
+        run: sudo /tmp/tun-linux.test -test.run '^TestPrivilegedDualTunIPv6RuleAndRouteLifecycle$|^TestNetworkUpdateMonitorRecoversAfterTheSubscriptionDies$|^TestNetworkUpdateMonitorDoesNotInstallASocketAfterClose$' -test.v -test.timeout 120s

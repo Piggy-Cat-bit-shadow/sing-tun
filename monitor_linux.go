@@ -26,8 +26,14 @@ const (
 type networkUpdateMonitor struct {
 	socket       *os.File
 	socketAccess sync.Mutex
+	socketClosed bool
 	update       chan struct{}
 	close        chan struct{}
+	closeOnce    sync.Once
+
+	// beforeInstallSocket is a test hook. It runs on the recovery goroutine after a replacement
+	// socket was opened and before it is installed, so a test can run Close inside that window.
+	beforeInstallSocket func(*os.File)
 
 	access    sync.Mutex
 	callbacks list.List[NetworkUpdateCallback]
@@ -71,7 +77,9 @@ func (m *networkUpdateMonitor) Start() error {
 	if socket == nil {
 		return nil
 	}
-	m.setSocket(socket)
+	if !m.setSocket(socket) {
+		return nil
+	}
 	go m.loopRead()
 	go m.loopUpdate(time.Second)
 	return nil
@@ -108,10 +116,20 @@ func (m *networkUpdateMonitor) openSocket() (*os.File, error) {
 	return os.NewFile(uintptr(netlinkSocket), "netlink"), nil
 }
 
-func (m *networkUpdateMonitor) setSocket(socket *os.File) {
+// setSocket installs a newly opened subscription unless the monitor is already closed. It reports
+// whether the monitor now owns the socket. An installation that loses the race against Close closes
+// the socket itself: the Close that won has already taken (and closed) whatever was installed, so
+// this socket would otherwise be left open with no owner and no reader.
+func (m *networkUpdateMonitor) setSocket(socket *os.File) bool {
 	m.socketAccess.Lock()
+	if m.socketClosed {
+		m.socketAccess.Unlock()
+		_ = socket.Close()
+		return false
+	}
 	m.socket = socket
 	m.socketAccess.Unlock()
+	return true
 }
 
 func (m *networkUpdateMonitor) socketFile() *os.File {
@@ -161,7 +179,14 @@ func (m *networkUpdateMonitor) loopRead() {
 				// The platform refuses the groups altogether; there is nothing to recover into.
 				return
 			} else {
-				m.setSocket(reopened)
+				if m.beforeInstallSocket != nil {
+					m.beforeInstallSocket(reopened)
+				}
+				if !m.setSocket(reopened) {
+					// Close won the window between opening the replacement and installing it. The
+					// socket is already closed by setSocket; nothing may resume reading.
+					return
+				}
 				recovered = true
 				continue
 			}
@@ -172,6 +197,11 @@ func (m *networkUpdateMonitor) loopRead() {
 		backoff = time.Second
 		// One event after recovery, so the upper layer re-reads interfaces and routes that changed
 		// while the subscription was dead.
+		select {
+		case <-m.close:
+			return
+		default:
+		}
 		select {
 		case m.update <- struct{}{}:
 		default:
@@ -213,18 +243,24 @@ func (m *networkUpdateMonitor) loopUpdate(minDuration time.Duration) {
 }
 
 func (m *networkUpdateMonitor) Close() error {
-	select {
-	case <-m.close:
+	closedNow := false
+	var closeErr error
+	m.closeOnce.Do(func() {
+		closedNow = true
+		close(m.close)
+		m.socketAccess.Lock()
+		// Set before taking the socket: a recovery that installs concurrently must observe this and
+		// close the socket it opened instead of leaving it installed on a closed monitor.
+		m.socketClosed = true
+		socket := m.socket
+		m.socket = nil
+		m.socketAccess.Unlock()
+		if socket != nil {
+			closeErr = socket.Close()
+		}
+	})
+	if !closedNow {
 		return os.ErrClosed
-	default:
 	}
-	close(m.close)
-	m.socketAccess.Lock()
-	socket := m.socket
-	m.socket = nil
-	m.socketAccess.Unlock()
-	if socket != nil {
-		return socket.Close()
-	}
-	return nil
+	return closeErr
 }
