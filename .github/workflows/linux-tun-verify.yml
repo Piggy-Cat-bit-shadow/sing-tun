@@ -20,8 +20,8 @@ jobs:
       - name: Linux unit tests (non-root)
         run: |
           go test -count=1 -v -timeout 5m \
-            -run 'TestNextIPv6RulePriority|TestRoutes|TestTwoTunInstances|TestTCPNat|TestMemoryTun|TestSlowJudgement|TestJudgement|TestDispatcher' .
+            -run 'TestNextIPv6RulePriority|TestRoutes|TestTwoTunInstances|TestTCPNat|TestMemoryTun|TestSlowJudgement|TestJudgement|TestDispatcher|TestAnEvictedEntryCancelsTheDialItLaunched|TestAnExplicitCloseCancelsTheDialItLaunched|TestACapacityEvictionCancelsTheDialItLaunched' .
       - name: Build test binary
         run: go test -c -vet=off -o /tmp/tun-linux.test .
       - name: Real dual-TUN rule/route lifecycle (root)
-        run: sudo /tmp/tun-linux.test -test.run '^TestPrivilegedDualTunIPv6RuleAndRouteLifecycle$' -test.v -test.timeout 60s
+        run: sudo /tmp/tun-linux.test -test.run '^TestPrivilegedDualTunIPv6RuleAndRouteLifecycle$|^TestNetworkUpdateMonitorRecoversAfterTheSubscriptionDies$' -test.v -test.timeout 90s

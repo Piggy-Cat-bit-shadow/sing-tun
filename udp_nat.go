@@ -432,7 +432,9 @@ func (s *UDPNat) getOrCreate(key udpNatSessionKey, source M.Socksaddr, destinati
 			newConn.interfaceIndex = interfaceIndex
 			s.registerClass(newConn)
 		}
-		newContext = ctx
+		// The handler runs the outbound creation for this entry. Deriving its context from the
+		// entry means an evicted entry cancels a dial nobody is waiting for any more.
+		newContext, newConn.cancelContext = context.WithCancel(ctx)
 		newOnClose = onClose
 		s.sessionsCreated.Add(1)
 		return newConn, true
@@ -658,10 +660,15 @@ type UDPNatConn struct {
 	// queuedBytes is the payload this session has queued, bounded by maxQueuedBytes.
 	// It is a CAS counter rather than a field under packetAccess because the read path
 	// (ReadPacket) and the close drain do not hold that lock through the channel hand-off.
-	queuedBytes     atomic.Int64
-	maxQueuedBytes  int64
-	packetAccess    sync.RWMutex
-	closeOnce       sync.Once
+	queuedBytes    atomic.Int64
+	maxQueuedBytes int64
+	packetAccess   sync.RWMutex
+	closeOnce      sync.Once
+	// cancelContext ends the per-entry lifetime: the handler's NewPacketConnectionEx runs on a
+	// context derived from this entry, so closing the entry cancels the dial it launched. The
+	// entry is closed by the idle timer, an explicit Close, and by eviction from the cache;
+	// before this existed the dial kept running after every one of them.
+	cancelContext   context.CancelFunc
 	doneChan        chan struct{}
 	readDeadline    pipe.Deadline
 	writeDeadline   pipe.Deadline
@@ -981,6 +988,9 @@ func (c *UDPNatConn) close() {
 		c.clearFilterPeers()
 		if c.interfaceIndex != 0 {
 			c.service.unregisterClass(c)
+		}
+		if c.cancelContext != nil {
+			c.cancelContext()
 		}
 		common.Close(c.writer)
 	})

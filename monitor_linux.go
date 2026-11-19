@@ -24,9 +24,10 @@ const (
 )
 
 type networkUpdateMonitor struct {
-	socket *os.File
-	update chan struct{}
-	close  chan struct{}
+	socket       *os.File
+	socketAccess sync.Mutex
+	update       chan struct{}
+	close        chan struct{}
 
 	access    sync.Mutex
 	callbacks list.List[NetworkUpdateCallback]
@@ -63,9 +64,26 @@ func NewNetworkUpdateMonitor(logger logger.Logger) (NetworkUpdateMonitor, error)
 }
 
 func (m *networkUpdateMonitor) Start() error {
+	socket, err := m.openSocket()
+	if err != nil {
+		return err
+	}
+	if socket == nil {
+		return nil
+	}
+	m.setSocket(socket)
+	go m.loopRead()
+	go m.loopUpdate(time.Second)
+	return nil
+}
+
+// openSocket creates and binds the subscription. A nil socket with a nil error means the platform
+// refuses these netlink groups (gVisor does), which is a working monitor with nothing to report rather
+// than a failure.
+func (m *networkUpdateMonitor) openSocket() (*os.File, error) {
 	netlinkSocket, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, unix.NETLINK_ROUTE)
 	if err != nil {
-		return E.Cause(err, "create netlink socket")
+		return nil, E.Cause(err, "create netlink socket")
 	}
 	groups := uint32(netlinkGroups)
 	if runtime.GOOS == "android" {
@@ -79,32 +97,81 @@ func (m *networkUpdateMonitor) Start() error {
 		unix.Close(netlinkSocket)
 		// gVisor rejects these netlink groups with EOPNOTSUPP, or EACCES in releases before 2025-11
 		if E.IsMulti(err, unix.EOPNOTSUPP, unix.EACCES) {
-			return nil
+			return nil, nil
 		}
-		return E.Cause(err, "subscribe netlink groups")
+		return nil, E.Cause(err, "subscribe netlink groups")
 	}
 	err = unix.SetsockoptInt(netlinkSocket, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, netlinkReceiveBufferSize)
 	if err != nil {
 		unix.SetsockoptInt(netlinkSocket, unix.SOL_SOCKET, unix.SO_RCVBUF, netlinkReceiveBufferSize)
 	}
-	m.socket = os.NewFile(uintptr(netlinkSocket), "netlink")
-	go m.loopRead()
-	go m.loopUpdate(time.Second)
-	return nil
+	return os.NewFile(uintptr(netlinkSocket), "netlink"), nil
+}
+
+func (m *networkUpdateMonitor) setSocket(socket *os.File) {
+	m.socketAccess.Lock()
+	m.socket = socket
+	m.socketAccess.Unlock()
+}
+
+func (m *networkUpdateMonitor) socketFile() *os.File {
+	m.socketAccess.Lock()
+	defer m.socketAccess.Unlock()
+	return m.socket
 }
 
 func (m *networkUpdateMonitor) loopRead() {
 	buffer := make([]byte, unix.Getpagesize())
+	backoff := time.Second
 	for {
-		_, err := m.socket.Read(buffer)
-		if err != nil && !errors.Is(err, unix.ENOBUFS) {
-			select {
-			case <-m.close:
-			default:
-				m.logger.Error("read netlink socket: ", err)
-			}
+		socket := m.socketFile()
+		if socket == nil {
 			return
 		}
+		_, err := socket.Read(buffer)
+		if err == nil || errors.Is(err, unix.ENOBUFS) {
+			backoff = time.Second
+			select {
+			case m.update <- struct{}{}:
+			default:
+			}
+			continue
+		}
+		select {
+		case <-m.close:
+			return
+		default:
+		}
+		// The subscription is gone: the kernel closed it, the socket was closed under us, or the read
+		// failed unrecoverably. Returning here is what left the process with a monitor that never
+		// reported anything again (upstream sing-tun #110, which this fork had traded for silence).
+		m.logger.Error("read netlink socket: ", err)
+		_ = socket.Close()
+		recovered := false
+		for !recovered {
+			select {
+			case <-m.close:
+				return
+			case <-time.After(backoff):
+			}
+			reopened, reopenErr := m.openSocket()
+			if reopenErr != nil {
+				m.logger.Error("reopen netlink socket: ", reopenErr)
+			} else if reopened == nil {
+				// The platform refuses the groups altogether; there is nothing to recover into.
+				return
+			} else {
+				m.setSocket(reopened)
+				recovered = true
+				continue
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		}
+		backoff = time.Second
+		// One event after recovery, so the upper layer re-reads interfaces and routes that changed
+		// while the subscription was dead.
 		select {
 		case m.update <- struct{}{}:
 		default:
@@ -152,8 +219,12 @@ func (m *networkUpdateMonitor) Close() error {
 	default:
 	}
 	close(m.close)
-	if m.socket != nil {
-		return m.socket.Close()
+	m.socketAccess.Lock()
+	socket := m.socket
+	m.socket = nil
+	m.socketAccess.Unlock()
+	if socket != nil {
+		return socket.Close()
 	}
 	return nil
 }
